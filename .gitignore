@@ -2,6 +2,7 @@
 
 # Virtuelle Umgebung
 venv/
+beispiel/
 
 # KI-Modell Checkpoints (zu groß für Git, ~1.6 GB)
 checkpoints/
