@@ -1,0 +1,28 @@
+# CrackDetect – Python Abhängigkeiten
+# torch + torchvision werden separat via start.bat installiert (CUDA-Version)
+
+# UI
+gradio>=4.44.0
+
+# Geo
+rasterio>=1.3.0
+shapely>=2.0.0
+
+# CAD Export
+ezdxf>=1.1.0
+
+# Bild-Verarbeitung
+Pillow>=10.0.0
+numpy>=1.24.0
+opencv-python-headless>=4.8.0
+
+# Modell-Hilfsbibliotheken
+supervision>=0.22.0
+transformers>=4.44.0
+huggingface_hub>=0.24.0
+accelerate>=0.30.0
+tqdm>=4.66.0
+einops>=0.7.0
+
+# Kompilierungs-Helfer (Windows)
+pycocotools>=2.0.7

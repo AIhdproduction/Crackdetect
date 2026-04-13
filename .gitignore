@@ -1,0 +1,33 @@
+# Nur crackdetect.py, requirements.txt und start.bat werden versioniert.
+
+# Virtuelle Umgebung
+venv/
+
+# KI-Modell Checkpoints (zu groß für Git, ~1.6 GB)
+checkpoints/
+
+# Ausgabe-Dateien
+output/
+
+# Test-Daten
+test/
+
+# Setup-Marke
+.setup_complete
+
+# Projekt-Dokumentation (lokal)
+projekt.md
+
+# Python Cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+dist/
+build/
+
+# Windows
+Thumbs.db
+Desktop.ini
