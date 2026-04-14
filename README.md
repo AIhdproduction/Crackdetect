@@ -10,7 +10,7 @@ CrackDetect ist eine lokale Desktop-App zur **automatischen Riss-Erkennung** in 
   - GeoTIFF-Orthofotos mit echten Koordinaten (CRS, Affin-Transform).
   - World-File-Unterstützung: JPG/PNG mit Sidecar-Dateien (`.jgw` / `.pgw` / `.tfw` + `.prj`).
 - **Riss-Konturen**: Die erkannten Risse werden als geschlossene Umrandungen (Konturen) exportiert – die exakte Kante jedes Risses.
-- **Tiling für große Bilder**: Bilder >2500 px werden automatisch gekachelt (1024×1024 px, 256 px Überlappung). Überlappende Erkennungen werden zusammengeführt.
+- **Tiling fuer grosse Bilder**: Bilder >= Kachelgroesse werden automatisch gekachelt (Standard: 1024x1024 px, 256 px Ueberlappung). Ueberlappende Erkennungen werden zusammengefuehrt.
 - **Batch-Verarbeitung**: Komplette Ordner auf einmal verarbeiten.
 - **CAD & GIS Export** – wird automatisch neben dem Eingabebild gespeichert:
   - **Annotiertes Bild** (`<name>_cracks.png`): Original mit blauen Risslinien (skaliert auf max. 2000 px).
@@ -24,7 +24,7 @@ CrackDetect ist für Windows konzipiert und bietet ein automatisches Setup-Skrip
 
 1. Stelle sicher, dass **Python 3.10–3.12** und **Git** installiert sind.
 2. Führe die Datei `start.bat` aus.
-   - *Beim ersten Start:* Die virtuelle Umgebung wird erstellt, PyTorch mit CUDA sowie alle Pakete heruntergeladen (~5 GB Checkpoints). Dieser Vorgang kann 15–40 Minuten dauern.
+   - *Beim ersten Start:* Die virtuelle Umgebung wird erstellt, PyTorch mit CUDA sowie alle Pakete heruntergeladen (~3 GB fuer PyTorch + Abhaengigkeiten). Dieser Vorgang kann 15–40 Minuten dauern.
    - *Bei weiteren Starts:* Das Desktop-Fenster öffnet sich direkt.
 
 ## Technologie-Stack
@@ -37,14 +37,14 @@ CrackDetect ist für Windows konzipiert und bietet ein automatisches Setup-Skrip
 
 ## Nutzung
 
-1. Klicke auf **„Bild(er) auswählen"** oder **„Ordner auswählen"**.
-2. Wähle den Erkennungs-Typ (Strassenrisse, Betonrisse, …) und passe Confidence / Min.-Fläche an.
-3. Klicke auf **„▶ Risse erkennen"**.
+1. Klicke auf **„Bild(er) auswaehlen"** oder **„Ordner auswaehlen"**.
+2. Passe **Confidence** und **Min.-Flaeche** an.
+3. Klicke auf **„Risse erkennen"**.
 4. Die Ergebnisse werden automatisch im Unterordner `output/` neben dem Eingabebild gespeichert:
    - `<name>_cracks.png` – Bild mit blauen Risslinien
    - `cracks_<ts>.geojson` – Vektordaten (LineStrings)
    - `cracks_<ts>.dxf` – CAD-Export
-5. Mit **"Ordner öffnen"** öffnet sich der Ausgabeordner direkt im Explorer.
+5. Mit **"Output"** öffnet sich der Ausgabeordner direkt im Explorer.
 
 ## Eigenes Modell trainieren
 

@@ -5,7 +5,7 @@ Powered by U-Net (trainiertes Modell -> Pixel-Masken)
 
 Pipeline:
   1. Bild laden (JPG/PNG/TIFF - mit rasterio falls GeoTIFF)
-  2. Automatisches Tiling fuer grosse Bilder (> MAX_DIRECT_SIZE px)
+  2. Automatisches Tiling fuer grosse Bilder (>= Kachelgroesse)
   3. U-Net erkennt Risse (direkte Pixel-Segmentierung)
   4. Morphologisches Closing verbindet unterbrochene Risse
   5. Masken werden zu Shapely-Polygonen vektorisiert
@@ -81,14 +81,22 @@ except ImportError:
 
 BASE_DIR = Path(__file__).parent
 
-TILE_SIZE        = 768    # Standard-Kachelgroesse (512/768/1024 via UI)
-TILE_OVERLAP_PCT = 0.15   # 15% Ueberlappung
-MAX_DIRECT_SIZE  = 2500   # Ueber diesem Wert wird automatisch getiled
+TILE_SIZE        = 1024   # Standard-Kachelgroesse (512/768/1024 via UI)
+TILE_OVERLAP     = 256    # Feste Ueberlappung in Pixel
+TILE_OVERLAP_PCT = TILE_OVERLAP / TILE_SIZE  # fuer compute_tiles()
+
+
+DEFAULT_CONFIDENCE = 0.70  # U-Net Schwellwert (0.01 - 0.99)
+DEFAULT_MIN_AREA   = 200   # Minimale Rissflaeche in px^2
 
 MAX_POLY_AREA    = 500_000  # Maximale Polygon-Flaeche px^2
 
 # Morphologisches Closing (verbindet unterbrochene Risse)
 CLOSING_KERNEL_SIZE = 5
+
+# Contour simplification factor (adjustable via settings dialog)
+# Lower = more detailed contours, higher = smoother/simpler
+_CONTOUR_EPSILON = 0.001
 
 SUPPORTED_EXT = {".jpg", ".jpeg", ".png", ".tif", ".tiff", ".bmp", ".webp"}
 
@@ -362,7 +370,7 @@ def compute_tiles(
 
 
 # ==============================================================================
-#  ERKENNUNG (SAM3 TEXT-PROMPT)
+#  ERKENNUNG (U-Net)
 # ==============================================================================
 
 def _apply_closing(mask: np.ndarray, kernel_size: int = CLOSING_KERNEL_SIZE) -> np.ndarray:
@@ -396,7 +404,7 @@ def detect_unet_tile(
         return [], []
 
     h, w = tile_np.shape[:2]
-    target_size = 768   # muss zum Training-Config passen
+    target_size = 512   # must match training config (config.yaml: image_size)
 
     # Preprocessing: resize + normalize (ImageNet stats)
     resized = cv2.resize(tile_np, (target_size, target_size),
@@ -414,12 +422,13 @@ def detect_unet_tile(
 
     # Sigmoid + threshold -> binary mask
     prob = 1.0 / (1.0 + np.exp(-logits[0, 0].astype(np.float64)))
-    binary = (prob > threshold).astype(bool)
 
-    # Rueck-skalieren auf originale Kachelgroesse
-    binary_resized = cv2.resize(
-        binary.astype(np.uint8), (w, h), interpolation=cv2.INTER_NEAREST
-    ).astype(bool)
+    # Upscale probability map with bilinear interpolation for smooth edges,
+    # then threshold. Much smoother than upscaling a binary mask with NEAREST.
+    prob_resized_full = cv2.resize(
+        prob.astype(np.float32), (w, h), interpolation=cv2.INTER_LINEAR
+    )
+    binary_resized = (prob_resized_full > threshold).astype(bool)
 
     if not np.any(binary_resized):
         return [], []
@@ -435,109 +444,6 @@ def detect_unet_tile(
     return [binary_resized], [score]
 
 
-def detect_in_tile(
-    tile_np: np.ndarray,
-    text_prompts: List[str],
-    confidence: float,
-    log_fn=None,
-) -> Tuple[List[np.ndarray], List[float]]:
-    """
-    Erkennt Risse in einem einzelnen Tile via SAM3 Text-Prompt.
-
-    Returns:
-        masks  - Liste von bool-Masken (H x W)
-        scores - geschaetzte Konfidenz-Scores
-    """
-    global _sam3_proc
-
-    h, w = tile_np.shape[:2]
-    pil_tile = Image.fromarray(tile_np)
-
-    try:
-        state = _sam3_proc.set_image(pil_tile)
-    except Exception as exc:
-        msg = f"[FEHLER] SAM3 set_image: {exc}"
-        print(msg)
-        if log_fn:
-            log_fn(f"   {msg}")
-        return [], []
-
-    original_conf = None
-    if hasattr(_sam3_proc, "confidence_threshold"):
-        original_conf = _sam3_proc.confidence_threshold
-        _sam3_proc.confidence_threshold = confidence
-
-    masks_out  = []
-    scores_out = []
-
-    for prompt in text_prompts:
-        try:
-            _sam3_proc.reset_all_prompts(state)
-            result_state = _sam3_proc.set_text_prompt(prompt, state)
-        except Exception as exc:
-            if log_fn:
-                log_fn(f"   [FEHLER] SAM3 Prompt '{prompt}': {exc}")
-            continue
-
-        raw_masks  = result_state.get("masks")
-        raw_scores = result_state.get("scores")
-
-        if raw_masks is None or (hasattr(raw_masks, "__len__") and len(raw_masks) == 0):
-            if log_fn:
-                log_fn(f"   [SAM3] '{prompt}': 0 Masken (alle unter Schwellwert {confidence:.2f})")
-            continue
-
-        n_raw = raw_masks.shape[0] if hasattr(raw_masks, "shape") else len(raw_masks)
-
-        if hasattr(raw_masks, "cpu"):
-            raw_masks = raw_masks.cpu().numpy()
-        if raw_scores is not None and hasattr(raw_scores, "cpu"):
-            raw_scores = raw_scores.cpu().numpy()
-
-        if n_raw > SAM3_MAX_MASKS_PER_TILE:
-            top_idx    = np.argsort(raw_scores)[::-1][:SAM3_MAX_MASKS_PER_TILE]
-            raw_masks  = raw_masks[top_idx]
-            raw_scores = raw_scores[top_idx]
-            n_kept = SAM3_MAX_MASKS_PER_TILE
-        else:
-            n_kept = n_raw
-
-        if log_fn:
-            log_fn(f"   [SAM3] '{prompt}': {n_raw} Masken (behalte Top-{n_kept})")
-
-        for i, m in enumerate(raw_masks):
-            if m.ndim == 4:
-                m = m[0, 0]
-            elif m.ndim == 3:
-                m = m[0]
-            if m.shape != (h, w):
-                m = cv2.resize(m.astype(np.float32), (w, h), interpolation=cv2.INTER_LINEAR)
-
-            binary = (m > 0.5).astype(bool)
-            px_count = int(np.count_nonzero(binary))
-
-            if px_count < SAM3_MIN_MASK_PX:
-                continue
-
-            # Morphologisches Closing
-            binary = _apply_closing(binary)
-
-            # Aspect-Ratio-Filter
-            if not _passes_aspect_ratio(binary):
-                continue
-
-            score = float(raw_scores[i]) if raw_scores is not None and i < len(raw_scores) else confidence
-            masks_out.append(binary)
-            scores_out.append(score)
-
-    del state
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
-
-    if original_conf is not None:
-        _sam3_proc.confidence_threshold = original_conf
-
-    return masks_out, scores_out
 
 
 # ==============================================================================
@@ -555,6 +461,11 @@ def mask_to_polygon(
         return None
 
     mask_u8 = (mask.astype(np.uint8)) * 255
+
+    # Smooth the mask before contour extraction to remove jagged staircase edges
+    mask_u8 = cv2.GaussianBlur(mask_u8, (5, 5), sigmaX=1.5)
+    mask_u8 = (mask_u8 > 127).astype(np.uint8) * 255
+
     contours, _ = cv2.findContours(mask_u8, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
     if not contours:
@@ -564,7 +475,8 @@ def mask_to_polygon(
     if cv2.contourArea(largest) < min_area:
         return None
 
-    eps    = 0.002 * cv2.arcLength(largest, True)
+    # Gentle simplification to keep the contour smooth
+    eps    = _CONTOUR_EPSILON * cv2.arcLength(largest, True)
     approx = cv2.approxPolyDP(largest, eps, True)
 
     if len(approx) < 3:
@@ -808,7 +720,7 @@ def _run_scale(
 ) -> Tuple[List, List[float]]:
     """Fuhrt einen vollstaendigen Tiling-Durchlauf via U-Net durch."""
     h, w = img.shape[:2]
-    needs_tiling = max(w, h) > MAX_DIRECT_SIZE
+    needs_tiling = max(w, h) >= tile_size
     all_polygons: List = []
     all_scores: List[float] = []
 
@@ -1035,7 +947,7 @@ def process_geo_image(
     cv2.putText(render, "Rissflaeche", (28, legend_y - 18),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.38, (230, 230, 230), 1, cv2.LINE_AA)
     cv2.line(render, (12, legend_y - 8), (24, legend_y - 8), LINE_COLOR, 2)
-    cv2.putText(render, "Mittellinie", (28, legend_y - 4),
+    cv2.putText(render, "Risskontur", (28, legend_y - 4),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.38, (230, 230, 230), 1, cv2.LINE_AA)
 
     return render, crack_features
@@ -1187,21 +1099,7 @@ def export_dxf(
     return output_path
 
 
-# ==============================================================================
-#  PROMPT-VORLAGEN
-# ==============================================================================
 
-PROMPT_PRESETS = {
-    "Strassenrisse":     "crack . pavement crack . fissure",
-    "Betonrisse":        "crack . concrete crack . spalling",
-    "Mauerwerk":         "crack . fracture . masonry crack",
-    "Fassade":           "crack . facade crack . plaster crack",
-    "Bruecke":           "crack . structural crack . fracture . spalling",
-    "Benutzerdefiniert": "",
-}
-
-PROMPT_PRESET_NAMES = list(PROMPT_PRESETS.keys())
-DEFAULT_PRESET      = PROMPT_PRESET_NAMES[0]
 
 
 # ==============================================================================
@@ -1254,21 +1152,15 @@ class Worker:
     def run(
         self,
         image_paths: List[Path],
-        preset: str,
-        custom_prompt: str,
         confidence: float,
         min_area: int,
         tile_size: int,
         multi_scale: bool,
-        use_unet: bool = False,
+        do_geojson: bool = True,
+        do_dxf: bool = False,
+        do_mask: bool = False,
     ):
         self._stop_event.clear()
-
-        if preset == "Benutzerdefiniert":
-            text_prompt = custom_prompt.strip() or "crack"
-        else:
-            base        = PROMPT_PRESETS.get(preset, "crack")
-            text_prompt = f"{base} . {custom_prompt.strip()}" if custom_prompt.strip() else base
 
         input_dir  = image_paths[0].parent
         output_dir = input_dir / "output"
@@ -1326,12 +1218,10 @@ class Worker:
 
                 annotated, crack_features = process_geo_image(
                     geo_image,
-                    text_prompt  = text_prompt,
                     confidence   = confidence,
                     min_area     = min_area,
                     tile_size    = tile_size,
                     multi_scale  = multi_scale,
-                    use_unet     = use_unet,
                     progress_cb  = _tile_cb,
                     log_fn       = self._log,
                 )
@@ -1354,51 +1244,86 @@ class Worker:
                 self._q.put(("last_output", str(out_img)))
                 self._log(f"   Gespeichert: {out_img.name} ({annotated.shape[1]}x{annotated.shape[0]} px)")
 
+                # --- Mask export (binary PNG, full resolution) ---
+                if do_mask and crack_features:
+                    img_h, img_w = geo_image.height, geo_image.width
+                    mask_canvas = np.zeros((img_h, img_w), dtype=np.uint8)
+                    for feat in crack_features:
+                        geom = feat.geometry
+                        if geom is None:
+                            continue
+                        try:
+                            if hasattr(geom, "exterior"):
+                                pts = np.array(list(geom.exterior.coords), dtype=np.int32)
+                            elif hasattr(geom, "coords"):
+                                pts = np.array(list(geom.coords), dtype=np.int32)
+                            else:
+                                continue
+                            cv2.fillPoly(mask_canvas, [pts], 255)
+                        except Exception:
+                            pass
+                    mask_path = output_dir / f"{stem}_mask.png"
+                    cv2.imwrite(str(mask_path), mask_canvas)
+                    self._log(f"   Maske:   {mask_path.name} ({img_w}x{img_h} px)")
+
                 all_entries.append((geo_image, crack_features))
 
             except Exception as exc:
                 self._log(f"   Fehler: {exc}")
                 traceback.print_exc()
 
-        # --- GeoJSON Export ---
         ts           = _dt.datetime.now().strftime("%Y%m%d_%H%M%S")
         geojson_path = str(output_dir / f"cracks_{ts}.geojson")
         dxf_path     = str(output_dir / f"cracks_{ts}.dxf")
 
-        self._status("Exportiere GeoJSON ...")
-        self._progress(0.97)
+        # --- GeoJSON Export ---
         geojson_ok = False
-        try:
-            if HAS_SHAPELY:
-                export_geojson(all_entries, geojson_path)
-                total_features = sum(len(g) for _, g in all_entries)
-                self._log(f"   GeoJSON: cracks_{ts}.geojson ({total_features} Features)")
-                geojson_ok = True
-            else:
-                self._log("   GeoJSON uebersprungen (shapely fehlt)")
-        except Exception as exc:
-            self._log(f"   GeoJSON-Fehler: {exc}")
+        if do_geojson:
+            self._status("Exportiere GeoJSON ...")
+            self._progress(0.97)
+            try:
+                if HAS_SHAPELY:
+                    export_geojson(all_entries, geojson_path)
+                    total_features = sum(len(g) for _, g in all_entries)
+                    self._log(f"   GeoJSON: cracks_{ts}.geojson ({total_features} Features)")
+                    geojson_ok = True
+                else:
+                    self._log("   GeoJSON uebersprungen (shapely fehlt)")
+            except Exception as exc:
+                self._log(f"   GeoJSON-Fehler: {exc}")
 
         # --- DXF Export ---
-        self._status("Exportiere DXF ...")
-        self._progress(0.99)
         dxf_ok = False
-        try:
-            if HAS_EZDXF and HAS_SHAPELY:
-                export_dxf(all_entries, dxf_path)
-                self._log(f"   DXF:     cracks_{ts}.dxf")
-                dxf_ok = True
-            elif not HAS_EZDXF:
-                self._log("   DXF uebersprungen (ezdxf fehlt - pip install ezdxf)")
-        except Exception as exc:
-            self._log(f"   DXF-Fehler: {exc}")
+        if do_dxf:
+            self._status("Exportiere DXF ...")
+            self._progress(0.99)
+            try:
+                if HAS_EZDXF and HAS_SHAPELY:
+                    export_dxf(all_entries, dxf_path)
+                    self._log(f"   DXF:     cracks_{ts}.dxf")
+                    dxf_ok = True
+                elif not HAS_EZDXF:
+                    self._log("   DXF uebersprungen (ezdxf fehlt - pip install ezdxf)")
+            except Exception as exc:
+                self._log(f"   DXF-Fehler: {exc}")
 
         total_cracks  = sum(len(g) for _, g in all_entries)
         total_elapsed = time.time() - t_start
+
+        # Build summary line for enabled exports
+        export_parts = []
+        if do_geojson:
+            export_parts.append(f"GeoJSON: {'OK' if geojson_ok else 'FEHLER'}")
+        if do_dxf:
+            export_parts.append(f"DXF: {'OK' if dxf_ok else 'FEHLER'}")
+        if do_mask:
+            export_parts.append("Maske: OK")
+        export_summary = "  |  ".join(export_parts) if export_parts else "Keine Exporte"
+
         self._log(
             f"\n{'─' * 54}\n"
             f"  {total_cracks} Risse | {total} Bild(er) | {total_elapsed:.1f}s\n"
-            f"  GeoJSON: {'OK' if geojson_ok else 'FEHLER'}  |  DXF: {'OK' if dxf_ok else 'FEHLER'}\n"
+            f"  {export_summary}\n"
             f"  Output: {output_dir}\n"
             f"{'─' * 54}"
         )
@@ -1461,7 +1386,7 @@ class CrackDetectApp(ctk.CTk):
         ctk.set_default_color_theme("dark-blue")
 
         self.title("CrackDetect - Automatische Riss-Erkennung")
-        self.geometry("1100x780")
+        self.geometry("1180x970")
         self.minsize(900, 640)
         self.configure(fg_color=APP_COLORS["bg"])
 
@@ -1474,6 +1399,14 @@ class CrackDetectApp(ctk.CTk):
         self._last_annotated:  Optional[np.ndarray]      = None
         self._zoom_win:        Optional[ZoomWindow]       = None
         self._last_export:     dict                       = {}
+
+        # Settings (adjustable via settings dialog)
+        self._export_geojson = ctk.BooleanVar(value=True)
+        self._export_dxf     = ctk.BooleanVar(value=False)
+        self._export_mask    = ctk.BooleanVar(value=False)
+        self._epsilon_var    = ctk.DoubleVar(value=0.001)
+        self._tile_var       = ctk.StringVar(value="1024")
+        self._multiscale_var = ctk.BooleanVar(value=True)
 
         self._build_ui()
         self._poll()
@@ -1491,7 +1424,7 @@ class CrackDetectApp(ctk.CTk):
             text_color=APP_COLORS["highlight"],
         ).pack(side="left", padx=22, pady=14)
         unet_available = UNET_ONNX_PATH.exists()
-        model_hint = "U-Net" if unet_available else "SAM3"
+        model_hint = "U-Net" if unet_available else "Kein Modell"
         ctk.CTkLabel(
             hdr, text=f"Automatische Riss-Erkennung  |  {model_hint}  |  GeoJSON & DXF",
             font=ctk.CTkFont(size=12),
@@ -1539,77 +1472,31 @@ class CrackDetectApp(ctk.CTk):
         # Settings
         section("EINSTELLUNGEN")
 
-        ctk.CTkLabel(left, text="Erkennungs-Typ",
-                     font=ctk.CTkFont(size=12)).pack(anchor="w", padx=16, pady=(0, 2))
-        self._preset_var = ctk.StringVar(value=DEFAULT_PRESET)
-        ctk.CTkOptionMenu(
-            left, values=PROMPT_PRESET_NAMES,
-            variable=self._preset_var,
-            fg_color=APP_COLORS["accent"],
-            button_color=APP_COLORS["highlight"],
-            button_hover_color=APP_COLORS["hover"],
-            dropdown_fg_color="#1a1a2e",
-            font=ctk.CTkFont(size=13), width=258,
-            command=self._on_preset_change,
-        ).pack(padx=16, pady=(0, 10))
-
-        ctk.CTkLabel(left, text="Zusaetzliche Suchbegriffe",
-                     font=ctk.CTkFont(size=12)).pack(anchor="w", padx=16, pady=(0, 2))
-        self._custom_entry = ctk.CTkEntry(
-            left, placeholder_text="z.B. spalling . delamination",
-            font=ctk.CTkFont(size=12), width=258,
-        )
-        self._custom_entry.pack(padx=16, pady=(0, 10))
-
         ctk.CTkLabel(left, text="Confidence (empfindlicher unten)",
                      font=ctk.CTkFont(size=12)).pack(anchor="w", padx=16, pady=(0, 2))
-        self._conf_var = ctk.DoubleVar(value=SAM3_CONFIDENCE)
-        self._conf_label = ctk.CTkLabel(left, text=f"{SAM3_CONFIDENCE:.2f}",
+        self._conf_var = ctk.DoubleVar(value=DEFAULT_CONFIDENCE)
+        self._conf_label = ctk.CTkLabel(left, text=f"{DEFAULT_CONFIDENCE:.2f}",
                                         font=ctk.CTkFont(size=11),
                                         text_color=APP_COLORS["text_dim"])
         self._conf_label.pack(anchor="e", padx=16)
         ctk.CTkSlider(
-            left, from_=0.01, to=0.50, variable=self._conf_var,
+            left, from_=0.01, to=0.99, variable=self._conf_var,
             width=258, progress_color=APP_COLORS["highlight"],
             command=lambda v: self._conf_label.configure(text=f"{v:.2f}"),
         ).pack(padx=16, pady=(0, 10))
 
         ctk.CTkLabel(left, text="Min. Flaeche (px^2)",
                      font=ctk.CTkFont(size=12)).pack(anchor="w", padx=16, pady=(0, 2))
-        self._area_var = ctk.IntVar(value=SAM3_MIN_MASK_PX)
-        self._area_label = ctk.CTkLabel(left, text=f"{SAM3_MIN_MASK_PX}",
+        self._area_var = ctk.IntVar(value=DEFAULT_MIN_AREA)
+        self._area_label = ctk.CTkLabel(left, text=f"{DEFAULT_MIN_AREA}",
                                          font=ctk.CTkFont(size=11),
                                          text_color=APP_COLORS["text_dim"])
         self._area_label.pack(anchor="e", padx=16)
         ctk.CTkSlider(
-            left, from_=10, to=2000, variable=self._area_var,
+            left, from_=0, to=400, variable=self._area_var,
             width=258, progress_color=APP_COLORS["highlight"],
             command=lambda v: self._area_label.configure(text=f"{int(v)}"),
         ).pack(padx=16, pady=(0, 10))
-
-        # Tile-Groesse
-        ctk.CTkLabel(left, text="Kachelgroesse",
-                     font=ctk.CTkFont(size=12)).pack(anchor="w", padx=16, pady=(0, 2))
-        self._tile_var = ctk.StringVar(value="768")
-        ctk.CTkSegmentedButton(
-            left, values=["512", "768", "1024"],
-            variable=self._tile_var,
-            font=ctk.CTkFont(size=12), width=258,
-            selected_color=APP_COLORS["highlight"],
-            selected_hover_color=APP_COLORS["hover"],
-        ).pack(padx=16, pady=(0, 10))
-
-        # Multi-Scale
-        self._multiscale_var = ctk.BooleanVar(value=True)
-        ctk.CTkCheckBox(
-            left,
-            text="Feine Risse (Multi-Scale)",
-            variable=self._multiscale_var,
-            font=ctk.CTkFont(size=12),
-            checkbox_width=18, checkbox_height=18,
-            checkmark_color=APP_COLORS["highlight"],
-            border_color=APP_COLORS["accent"],
-        ).pack(anchor="w", padx=16, pady=(0, 10))
 
         # Modell-Status
         section("MODELL")
@@ -1679,13 +1566,22 @@ class CrackDetectApp(ctk.CTk):
         bar = ctk.CTkFrame(self, fg_color=APP_COLORS["accent"], corner_radius=0)
         bar.pack(fill="x", side="bottom")
 
+        # Settings button (left-most)
+        ctk.CTkButton(
+            bar, text="Einstellungen",
+            font=ctk.CTkFont(size=13),
+            fg_color="#2d3748", hover_color="#4a5568",
+            corner_radius=8, height=42, width=130,
+            command=self._open_settings,
+        ).pack(side="left", padx=(16, 8), pady=10)
+
         self._btn_start = ctk.CTkButton(
             bar, text="  Risse erkennen",
             font=ctk.CTkFont(size=14, weight="bold"),
             fg_color=APP_COLORS["highlight"], hover_color=APP_COLORS["hover"],
             corner_radius=8, height=42, command=self._start,
         )
-        self._btn_start.pack(side="left", padx=16, pady=10)
+        self._btn_start.pack(side="left", padx=(0, 8), pady=10)
 
         self._btn_stop = ctk.CTkButton(
             bar, text="  Abbrechen",
@@ -1723,10 +1619,98 @@ class CrackDetectApp(ctk.CTk):
             command=self._open_output,
         ).pack(side="right", padx=16, pady=10)
 
+    # --- Settings Dialog ---
+
+    def _open_settings(self):
+        """Opens a settings dialog for contour tolerance and export formats."""
+        win = ctk.CTkToplevel(self)
+        win.title("Einstellungen")
+        win.geometry("380x520")
+        win.resizable(False, False)
+        win.configure(fg_color=APP_COLORS["panel"])
+        win.transient(self)
+        win.grab_set()
+
+        def _section(parent, text, top_pad=18):
+            ctk.CTkLabel(
+                parent, text=text,
+                font=ctk.CTkFont(size=11, weight="bold"),
+                text_color=APP_COLORS["text_dim"],
+            ).pack(anchor="w", padx=20, pady=(top_pad, 2))
+            ctk.CTkFrame(parent, height=1, fg_color=APP_COLORS["accent"]).pack(fill="x", padx=20, pady=(0, 8))
+
+        # --- Contour tolerance ---
+        _section(win, "KONTUR-GLAETTUNG")
+
+        ctk.CTkLabel(
+            win, text="Niedrig = detailliert, hoch = glatt",
+            font=ctk.CTkFont(size=11), text_color=APP_COLORS["text_dim"],
+        ).pack(anchor="w", padx=20)
+
+        eps_label = ctk.CTkLabel(
+            win, text=f"{self._epsilon_var.get():.4f}",
+            font=ctk.CTkFont(size=11), text_color=APP_COLORS["text_dim"],
+        )
+        eps_label.pack(anchor="e", padx=20)
+
+        ctk.CTkSlider(
+            win, from_=0.0, to=0.002, variable=self._epsilon_var,
+            width=340, progress_color=APP_COLORS["highlight"],
+            command=lambda v: eps_label.configure(text=f"{v:.4f}"),
+        ).pack(padx=20, pady=(0, 12))
+
+        # --- Tile size ---
+        _section(win, "KACHELGROESSE", top_pad=4)
+
+        ctk.CTkLabel(
+            win, text="Kachelgroesse",
+            font=ctk.CTkFont(size=12),
+        ).pack(anchor="w", padx=20, pady=(0, 4))
+        ctk.CTkSegmentedButton(
+            win, values=["512", "768", "1024"],
+            variable=self._tile_var,
+            font=ctk.CTkFont(size=12), width=340,
+            selected_color=APP_COLORS["highlight"],
+            selected_hover_color=APP_COLORS["hover"],
+        ).pack(padx=20, pady=(0, 4))
+
+        ctk.CTkCheckBox(
+            win,
+            text="Feine Risse (Multi-Scale)",
+            variable=self._multiscale_var,
+            font=ctk.CTkFont(size=12),
+            checkbox_width=18, checkbox_height=18,
+            checkmark_color=APP_COLORS["highlight"],
+            border_color=APP_COLORS["accent"],
+        ).pack(anchor="w", padx=20, pady=(4, 8))
+
+        # --- Export formats ---
+        _section(win, "EXPORT-FORMATE", top_pad=4)
+
+        for label, var in [
+            ("GeoJSON (Vektordaten)", self._export_geojson),
+            ("DXF (CAD-Export)",      self._export_dxf),
+            ("Maske (PNG, Vollaufloesung)", self._export_mask),
+        ]:
+            ctk.CTkCheckBox(
+                win, text=label, variable=var,
+                font=ctk.CTkFont(size=12),
+                checkbox_width=18, checkbox_height=18,
+                checkmark_color=APP_COLORS["highlight"],
+                border_color=APP_COLORS["accent"],
+            ).pack(anchor="w", padx=20, pady=(0, 8))
+
+        # --- Close button ---
+        ctk.CTkButton(
+            win, text="Schliessen",
+            font=ctk.CTkFont(size=13, weight="bold"),
+            fg_color=APP_COLORS["highlight"], hover_color=APP_COLORS["hover"],
+            corner_radius=8, height=38, width=160,
+            command=win.destroy,
+        ).pack(pady=(14, 16))
+
     # --- Helpers ---
 
-    def _on_preset_change(self, _value):
-        pass
 
     def _browse_files(self):
         paths = filedialog.askopenfilenames(
@@ -1866,11 +1850,10 @@ class CrackDetectApp(ctk.CTk):
         self._append_log("=" * 54)
         multi = self._multiscale_var.get()
         tile  = int(self._tile_var.get())
-        use_unet = "U-Net" in self._model_var.get()
         self._append_log(
             f"Starte: {len(self._input_paths)} Bild(er) | "
             f"Kachel: {tile}px | Multi-Scale: {'ja' if multi else 'nein'} | "
-            f"Modell: {'U-Net' if use_unet else 'SAM3'}"
+            f"Modell: U-Net"
         )
 
         # Export-Buttons zuruecksetzen
@@ -1880,18 +1863,22 @@ class CrackDetectApp(ctk.CTk):
                                 text="  DXF", text_color="white")
         self._last_export = {}
 
+        # Apply contour epsilon setting
+        global _CONTOUR_EPSILON
+        _CONTOUR_EPSILON = self._epsilon_var.get()
+
         self._worker = Worker(self._msg_q)
         self._thread = threading.Thread(
             target=self._worker.run,
             args=(
                 self._input_paths,
-                self._preset_var.get(),
-                self._custom_entry.get(),
                 self._conf_var.get(),
                 int(self._area_var.get()),
                 tile,
                 multi,
-                use_unet,
+                self._export_geojson.get(),
+                self._export_dxf.get(),
+                self._export_mask.get(),
             ),
             daemon=True,
         )
@@ -1915,27 +1902,17 @@ if __name__ == "__main__":
     print()
     print(" ================================================================")
     print("   CrackDetect - Automatische Riss-Erkennung")
-    print("   Powered by SAM3 + U-Net")
+    print("   Powered by U-Net")
     print(" ================================================================")
     print()
 
-    # Versuche U-Net zu laden (optional, kein Fehler wenn nicht vorhanden)
-    unet_loaded = load_unet()
-
-    # SAM3 laden (Pflicht fuer SAM3-Modus)
-    print("[INFO] Lade SAM3 ...")
-    sam3_loaded = False
     try:
         load_models()
-        sam3_loaded = True
     except Exception as e:
-        print(f"  [WARN] SAM3 nicht geladen: {e}")
-        if not unet_loaded:
-            print("  Weder SAM3 noch U-Net verfuegbar.")
-            print("  Bitte start.bat ausfuehren und/oder Training abschliessen.")
-            input("  Enter druecken zum Beenden ...")
-            sys.exit(1)
-        print("  SAM3 nicht verfuegbar - nur U-Net Modus moeglich.")
+        print(f"  [ERROR] {e}")
+        print("  Lege dein trainiertes Modell hier ab: model/crack_unet.onnx")
+        input("  Enter druecken zum Beenden ...")
+        sys.exit(1)
 
     print("[INFO] Starte Desktop-App ...")
     app = CrackDetectApp()
