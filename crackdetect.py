@@ -885,35 +885,15 @@ def process_geo_image(
 
     rh, rw = render.shape[:2]
 
-    # Rissmasken als rotes semi-transparentes Overlay zeichnen
-    overlay = render.copy()
-
-    MASK_COLOR  = (50, 100, 220)   # Blau (RGB)
     LINE_COLOR  = (60, 120, 255)   # Hellblau (RGB)
-    NUM_COLOR   = (255, 255, 255) # Weiss
+    NUM_COLOR   = (255, 255, 255)  # Weiss
     LINE_THICK  = 1
-    ALPHA       = 0.40
 
     def _scaled_pts(coords):
         arr = np.array(coords, dtype=np.float32) * coord_scale
         return arr.astype(np.int32).reshape(-1, 1, 2)
 
-    # Zuerst alle Masken als gefuellte Polygone zeichnen
-    for feat in crack_features:
-        obj = feat.geometry
-        if obj is None:
-            continue
-        try:
-            if hasattr(obj, "exterior"):    # Polygon
-                pts = _scaled_pts(list(obj.exterior.coords))
-                cv2.fillPoly(overlay, [pts], MASK_COLOR)
-        except Exception:
-            pass
-
-    # Overlay einblenden
-    render = cv2.addWeighted(overlay, ALPHA, render, 1.0 - ALPHA, 0)
-
-    # Dann Kontur-Linien in Gelb darueber
+    # Kontur-Linien zeichnen
     for idx, feat in enumerate(crack_features):
         obj = feat.geometry
         if obj is None:
@@ -942,10 +922,7 @@ def process_geo_image(
 
     # Legende einzeichnen
     legend_y = rh - 10
-    cv2.rectangle(render, (8, legend_y - 32), (200, legend_y + 2), (20, 20, 20), -1)
-    cv2.rectangle(render, (12, legend_y - 28), (24, legend_y - 18), MASK_COLOR, -1)
-    cv2.putText(render, "Rissflaeche", (28, legend_y - 18),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.38, (230, 230, 230), 1, cv2.LINE_AA)
+    cv2.rectangle(render, (8, legend_y - 20), (160, legend_y + 2), (20, 20, 20), -1)
     cv2.line(render, (12, legend_y - 8), (24, legend_y - 8), LINE_COLOR, 2)
     cv2.putText(render, "Risskontur", (28, legend_y - 4),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.38, (230, 230, 230), 1, cv2.LINE_AA)
@@ -1169,7 +1146,11 @@ class Worker:
 
         total     = len(image_paths)
         all_entries: List[Tuple[GeoImage, List[CrackFeature]]] = []
-        t_start   = time.time()
+        t_start      = time.time()
+        geojson_ok   = False
+        dxf_ok       = False
+        last_geojson = ""
+        last_dxf     = ""
 
         for idx, img_path in enumerate(image_paths):
             if self._stop_event.is_set():
@@ -1266,46 +1247,39 @@ class Worker:
                     cv2.imwrite(str(mask_path), mask_canvas)
                     self._log(f"   Maske:   {mask_path.name} ({img_w}x{img_h} px)")
 
+                # --- GeoJSON Export (per image) ---
+                geojson_path = str(output_dir / f"{stem}_cracks.geojson")
+                if do_geojson and crack_features:
+                    try:
+                        if HAS_SHAPELY:
+                            export_geojson([(geo_image, crack_features)], geojson_path)
+                            self._log(f"   GeoJSON: {stem}_cracks.geojson ({len(crack_features)} Features)")
+                            geojson_ok = True
+                            last_geojson = geojson_path
+                        else:
+                            self._log("   GeoJSON uebersprungen (shapely fehlt)")
+                    except Exception as exc:
+                        self._log(f"   GeoJSON-Fehler: {exc}")
+
+                # --- DXF Export (per image) ---
+                dxf_path = str(output_dir / f"{stem}_cracks.dxf")
+                if do_dxf and crack_features:
+                    try:
+                        if HAS_EZDXF and HAS_SHAPELY:
+                            export_dxf([(geo_image, crack_features)], dxf_path)
+                            self._log(f"   DXF:     {stem}_cracks.dxf")
+                            dxf_ok = True
+                            last_dxf = dxf_path
+                        elif not HAS_EZDXF:
+                            self._log("   DXF uebersprungen (ezdxf fehlt - pip install ezdxf)")
+                    except Exception as exc:
+                        self._log(f"   DXF-Fehler: {exc}")
+
                 all_entries.append((geo_image, crack_features))
 
             except Exception as exc:
                 self._log(f"   Fehler: {exc}")
                 traceback.print_exc()
-
-        ts           = _dt.datetime.now().strftime("%Y%m%d_%H%M%S")
-        geojson_path = str(output_dir / f"cracks_{ts}.geojson")
-        dxf_path     = str(output_dir / f"cracks_{ts}.dxf")
-
-        # --- GeoJSON Export ---
-        geojson_ok = False
-        if do_geojson:
-            self._status("Exportiere GeoJSON ...")
-            self._progress(0.97)
-            try:
-                if HAS_SHAPELY:
-                    export_geojson(all_entries, geojson_path)
-                    total_features = sum(len(g) for _, g in all_entries)
-                    self._log(f"   GeoJSON: cracks_{ts}.geojson ({total_features} Features)")
-                    geojson_ok = True
-                else:
-                    self._log("   GeoJSON uebersprungen (shapely fehlt)")
-            except Exception as exc:
-                self._log(f"   GeoJSON-Fehler: {exc}")
-
-        # --- DXF Export ---
-        dxf_ok = False
-        if do_dxf:
-            self._status("Exportiere DXF ...")
-            self._progress(0.99)
-            try:
-                if HAS_EZDXF and HAS_SHAPELY:
-                    export_dxf(all_entries, dxf_path)
-                    self._log(f"   DXF:     cracks_{ts}.dxf")
-                    dxf_ok = True
-                elif not HAS_EZDXF:
-                    self._log("   DXF uebersprungen (ezdxf fehlt - pip install ezdxf)")
-            except Exception as exc:
-                self._log(f"   DXF-Fehler: {exc}")
 
         total_cracks  = sum(len(g) for _, g in all_entries)
         total_elapsed = time.time() - t_start
@@ -1331,8 +1305,8 @@ class Worker:
         self._status(f"Fertig - {total_cracks} Risse erkannt")
         # Exportpfade fuer UI-Buttons bekanntgeben
         self._q.put(("export_paths", {
-            "geojson": geojson_path if geojson_ok else None,
-            "dxf":     dxf_path     if dxf_ok     else None,
+            "geojson": last_geojson if geojson_ok else None,
+            "dxf":     last_dxf     if dxf_ok     else None,
             "output_dir": str(output_dir),
         }))
         self._done(True)
