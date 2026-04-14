@@ -1,25 +1,36 @@
-# Nur crackdetect.py, requirements.txt und start.bat werden versioniert.
+# ============================================
+# CrackDetect .gitignore
+# ============================================
 
-# Virtuelle Umgebung
+# Virtual environments
 venv/
-beispiel/
+Train/venv_train/
 
-# KI-Modell Checkpoints (zu groß für Git, ~1.6 GB)
+# Training (complete folder - data, models, scripts, venv)
+Train/
+
+# Model checkpoints (too large for Git)
 checkpoints/
+*.pth
 
-# Ausgabe-Dateien
+# Trained model folder (keep folder structure, ignore model files)
+model/*
+!model/.gitkeep
+
+# Output files
 output/
 
-# Test-Daten
+# Test data
 test/
+beispiel/
 
-# Setup-Marke
+# Setup marker
 .setup_complete
 
-# Projekt-Dokumentation (lokal)
+# Local documentation
 projekt.md
 
-# Python Cache
+# Python cache
 __pycache__/
 *.pyc
 *.pyo

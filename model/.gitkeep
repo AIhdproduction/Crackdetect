@@ -1,0 +1,3 @@
+# This folder contains the trained ONNX model.
+# Place your crack_unet.onnx file here.
+# The app will automatically load it on startup.

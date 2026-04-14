@@ -1,27 +1,34 @@
 """
-CrackDetect – Automatische Riss-Erkennung in Bildern und Orthofotos
+CrackDetect - Automatische Riss-Erkennung in Bildern und Orthofotos
 ====================================================================
-Powered by SAM3 (Text-Prompt → Pixel-Masken)
+Powered by SAM3 (Text-Prompt -> Pixel-Masken)
 
 Pipeline:
-  1. Bild laden (JPG/PNG/TIFF – mit rasterio falls GeoTIFF)
-  2. Automatisches Tiling für grosse Bilder (>2500 px)
-  3. SAM3 erkennt Risse via Text-Prompt "crack" (direkte Segmentierung)
-  4. Masken werden zu Shapely-Polygonen vektorisiert
-  5. NMS entfernt Duplikate aus überlappenden Kacheln
-  6. Pixel-Koordinaten → Weltkoordinaten (falls GeoTIFF mit CRS)
-  7. Export als GeoJSON + DXF
+  1. Bild laden (JPG/PNG/TIFF - mit rasterio falls GeoTIFF)
+  2. Automatisches Tiling fuer grosse Bilder (> MAX_DIRECT_SIZE px)
+     Optional: Multi-Scale (zweiter Durchlauf mit halber Kachelgroesse)
+  3. SAM3 erkennt Risse via Text-Prompt (direkte Segmentierung)
+  4. Morphologisches Closing verbindet unterbrochene Risse
+  5. Aspect-Ratio-Filter entfernt runde Flecken (keine Risse)
+  6. Masken werden zu Shapely-Polygonen vektorisiert
+  7. NMS entfernt Duplikate aus ueberlappenden Kacheln
+  8. Skelettierung: gefuellte Maske -> 1-px-Mittellinie
+  9. Distance Transform: Rissbreite (avg + max) pro Risspixel
+ 10. Pixel-Koordinaten -> Weltkoordinaten (falls GeoTIFF mit CRS)
+ 11. Export als GeoJSON (mit Attributen: Laenge, Breite, Confidence, Datum)
+     Optional: DXF-Export
 
-Für Details: siehe projekt.md
+Fuer Details: siehe projekt.md
 """
 
 import os
 import sys
 import json
 import time
+import datetime as _dt
 import traceback
 from pathlib import Path
-from typing import Optional, List, Tuple, Dict
+from typing import Optional, List, Tuple, Dict, Any
 
 import queue
 import threading
@@ -33,29 +40,36 @@ from PIL import Image
 import torch
 import customtkinter as ctk
 
-# ─── Optionale Geo-Imports ─────────────────────────────────────────────────────
+# --- Optionale Geo-Imports ---
 try:
     import rasterio
     from rasterio.transform import Affine
     HAS_RASTERIO = True
 except ImportError:
     HAS_RASTERIO = False
-    print("[WARN] rasterio nicht gefunden – GeoTIFF-Koordinaten nicht verfügbar")
+    print("[WARN] rasterio nicht gefunden - GeoTIFF-Koordinaten nicht verfuegbar")
 
 try:
-    from shapely.geometry import Polygon, mapping
+    from shapely.geometry import Polygon, LineString, mapping
     from shapely.ops import unary_union
     HAS_SHAPELY = True
 except ImportError:
     HAS_SHAPELY = False
-    print("[WARN] shapely nicht gefunden – nur Bild-Ausgabe möglich")
+    print("[WARN] shapely nicht gefunden - nur Bild-Ausgabe moeglich")
 
 try:
     import ezdxf
     HAS_EZDXF = True
 except ImportError:
     HAS_EZDXF = False
-    print("[WARN] ezdxf nicht gefunden – DXF-Export deaktiviert")
+    print("[WARN] ezdxf nicht gefunden - DXF-Export deaktiviert")
+
+try:
+    import onnxruntime as ort
+    HAS_ONNX = True
+except ImportError:
+    HAS_ONNX = False
+    print("[WARN] onnxruntime nicht gefunden - U-Net Inferenz nicht verfuegbar")
 
 try:
     from skimage.morphology import skeletonize as _skimage_skeletonize
@@ -63,36 +77,42 @@ try:
 except ImportError:
     HAS_SKIMAGE = False
 
-# ─── SAM3 Imports ─────────────────────────────────────────────────────────────
+# --- SAM3 Imports ---
 HAS_SAM3 = False
 try:
     from sam3 import build_sam3_image_model
     from sam3.model.sam3_image_processor import Sam3Processor
     HAS_SAM3 = True
 except ImportError:
-    print("[ERROR] SAM3 nicht installiert! Bitte start.bat erneut ausführen.")
+    print("[ERROR] SAM3 nicht installiert! Bitte start.bat erneut ausfuehren.")
 
-# ══════════════════════════════════════════════════════════════════════════════
+
+# ==============================================================================
 #  KONFIGURATION
-# ══════════════════════════════════════════════════════════════════════════════
+# ==============================================================================
 
-BASE_DIR         = Path(__file__).parent
-CHECKPOINTS_DIR  = BASE_DIR / "checkpoints"
-SAM3_CKPT_DIR    = CHECKPOINTS_DIR / "sam3"
-OUTPUT_DIR       = BASE_DIR / "output"
-OUTPUT_DIR.mkdir(exist_ok=True)
+BASE_DIR        = Path(__file__).parent
+CHECKPOINTS_DIR = BASE_DIR / "checkpoints"
+SAM3_CKPT_DIR   = CHECKPOINTS_DIR / "sam3"
 
-TILE_SIZE        = 1024   # Kachelgrösse in Pixeln
-TILE_OVERLAP     = 256    # Überlappung zwischen Kacheln
-MAX_DIRECT_SIZE  = 2500   # Über diesem Wert wird automatisch getiled
+TILE_SIZE        = 768    # Standard-Kachelgroesse (512/768/1024 via UI)
+TILE_OVERLAP_PCT = 0.15   # 15% Ueberlappung
+MAX_DIRECT_SIZE  = 2500   # Ueber diesem Wert wird automatisch getiled
 
-SAM3_CONFIDENCE       = 0.15   # Standard-Confidence für SAM3 Text-Suche
-SAM3_MIN_MASK_PX      = 100    # Mindestgrösse einer Maske in Pixeln
-SAM3_MAX_MASKS_PER_TILE = 30   # Maximale Masken pro Kachel (Top-N nach Score)
+SAM3_CONFIDENCE         = 0.08   # Niedrigerer Default fuer feinere Risse
+SAM3_MIN_MASK_PX        = 80     # Mindestgroesse einer Maske in Pixeln
+SAM3_MAX_MASKS_PER_TILE = 40     # Maximale Masken pro Kachel (Top-N nach Score)
+SAM3_MAX_POLY_AREA      = 500_000  # Maximale Polygon-Flaeche px^2
+
+# Aspect-Ratio Filter: Masken deren BBox-Verhaeltnis kleiner als dieser Wert
+# sind wahrscheinlich runde Flecken und keine Risse.
+ASPECT_RATIO_MIN = 1.8
+
+# Morphologisches Closing nach SAM3 (verbindet unterbrochene Risse)
+CLOSING_KERNEL_SIZE = 5
 
 SUPPORTED_EXT = {".jpg", ".jpeg", ".png", ".tif", ".tiff", ".bmp", ".webp"}
 
-# World-File Endungen pro Bildformat (für Sidecar-Georeferenzierung)
 WORLD_FILE_EXT = {
     ".jpg":  [".jgw", ".jpw"],
     ".jpeg": [".jgw", ".jpw"],
@@ -105,26 +125,29 @@ WORLD_FILE_EXT = {
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
-# Globale SAM3-Instanz
-_sam3_proc = None
+_sam3_proc   = None
+_unet_session = None   # onnxruntime InferenceSession fuer das trainierte U-Net
+
+# Pfad zum trainierten U-Net ONNX (liegt im model/ Ordner neben crackdetect.py)
+UNET_ONNX_PATH = BASE_DIR / "model" / "crack_unet.onnx"
+# Fallback: PyTorch checkpoint
+UNET_CKPT_PATH = BASE_DIR / "model" / "best_model.pth"
 
 
-# ══════════════════════════════════════════════════════════════════════════════
+# ==============================================================================
 #  MODELLE LADEN
-# ══════════════════════════════════════════════════════════════════════════════
+# ==============================================================================
 
 def load_models() -> None:
-    """Lädt SAM3 einmalig. Wird beim App-Start aufgerufen."""
+    """Laedt SAM3 einmalig. Wird beim App-Start aufgerufen."""
     global _sam3_proc
 
     if not HAS_SAM3:
-        raise RuntimeError("SAM3 nicht installiert – start.bat erneut ausführen.")
+        raise RuntimeError("SAM3 nicht installiert - start.bat erneut ausfuehren.")
 
     print(f"[INFO] Verwende Device: {DEVICE.upper()}")
 
-    # ── Monkey-patch: fused addmm_act → standard float32 ────────────────────
-    # Das Original erzwingt bfloat16 für einen fused CUDA-Kernel der
-    # möglicherweise nicht verfügbar ist. Ersatz durch Standard-Linear.
+    # Monkey-patch: fused addmm_act -> standard float32
     try:
         import sam3.perflib.fused as _fused_mod
         import sam3.model.vitdet as _vitdet_mod
@@ -136,15 +159,13 @@ def load_models() -> None:
         _fused_mod.addmm_act = _addmm_act_f32
         _vitdet_mod.addmm_act = _addmm_act_f32
     except Exception as e:
-        print(f"[WARN] Monkey-patch für addmm_act fehlgeschlagen: {e}")
+        print(f"[WARN] Monkey-patch fuer addmm_act fehlgeschlagen: {e}")
 
-    # ── BPE-Vokabular-Pfad für SAM3 Text-Encoder ────────────────────────────
     import sam3 as _sam3_pkg
     bpe_path = Path(_sam3_pkg.__file__).parent / "assets" / "bpe_simple_vocab_16e6.txt.gz"
     if not bpe_path.exists():
         bpe_path = Path(_sam3_pkg.__file__).parent.parent / "assets" / "bpe_simple_vocab_16e6.txt.gz"
 
-    # ── Checkpoint-Pfad auflösen ─────────────────────────────────────────────
     ckpt_path = None
     if SAM3_CKPT_DIR.exists():
         for candidate in ("sam3.pt", "model.safetensors"):
@@ -153,7 +174,7 @@ def load_models() -> None:
                 break
 
     if ckpt_path is None:
-        print("[INFO] Checkpoint nicht lokal – lade von HuggingFace ...")
+        print("[INFO] Checkpoint nicht lokal - lade von HuggingFace ...")
 
     print("[INFO] Lade SAM3 ...")
     model = build_sam3_image_model(
@@ -162,7 +183,6 @@ def load_models() -> None:
         device=DEVICE,
         load_from_HF=(ckpt_path is None),
     )
-    # Sicherstellen: float32 (Checkpoint kann bfloat16 sein)
     model = model.float()
 
     _sam3_proc = Sam3Processor(
@@ -174,9 +194,35 @@ def load_models() -> None:
     print(f"[OK]   SAM3 bereit ({DEVICE.upper()}).")
 
 
-# ══════════════════════════════════════════════════════════════════════════════
+def load_unet() -> bool:
+    """
+    Laedt das trainierte U-Net als ONNX-Session.
+    Gibt True zurueck wenn erfolgreich, False wenn kein Modell vorhanden.
+    """
+    global _unet_session
+
+    if not HAS_ONNX:
+        print("[WARN] onnxruntime fehlt - U-Net nicht verfuegbar (pip install onnxruntime)")
+        return False
+
+    onnx_path = UNET_ONNX_PATH
+    if not onnx_path.exists():
+        print(f"[INFO] Kein U-Net ONNX gefunden ({onnx_path})")
+        print("       Lege dein trainiertes Modell hier ab: model/crack_unet.onnx")
+        return False
+
+    print(f"[INFO] Lade U-Net ONNX: {onnx_path}")
+    providers = ["CUDAExecutionProvider", "CPUExecutionProvider"]
+    _unet_session = ort.InferenceSession(str(onnx_path), providers=providers)
+    used = _unet_session.get_providers()[0]
+    print(f"[OK]   U-Net bereit ({used}).")
+    return True
+
+
+
+# ==============================================================================
 #  GEO-BILD-WRAPPER
-# ══════════════════════════════════════════════════════════════════════════════
+# ==============================================================================
 
 class GeoImage:
     """
@@ -191,9 +237,9 @@ class GeoImage:
         crs=None,
         source_path: str = "",
     ):
-        self.image       = image          # HxWx3 uint8 RGB
-        self.transform   = transform      # rasterio Affin-Transform
-        self.crs         = crs            # rasterio CRS
+        self.image       = image
+        self.transform   = transform
+        self.crs         = crs
         self.source_path = source_path
         self.has_geo     = (transform is not None and crs is not None)
 
@@ -204,6 +250,14 @@ class GeoImage:
     @property
     def height(self) -> int:
         return self.image.shape[0]
+
+    def pixel_size_m(self) -> Optional[float]:
+        """Returns pixel size in meters if geo-referenced, else None."""
+        if not self.has_geo or self.transform is None:
+            return None
+        a = self.transform.a  # pixel width (x)
+        e = self.transform.e  # pixel height (y), negative
+        return abs(a + e) / 2.0
 
     def px_to_world(self, px: float, py: float) -> Tuple[float, float]:
         if not self.has_geo:
@@ -217,10 +271,9 @@ class GeoImage:
         return [self.px_to_world(x, y) for x, y in pixel_coords]
 
 
-# ── World-File / PRJ Hilfsfunktionen ──────────────────────────────────────────
+# --- World-File / PRJ Hilfsfunktionen ---
 
 def _find_world_file(image_path: Path) -> Optional[Path]:
-    """Sucht ein World-File (.jgw, .tfw, etc.) neben dem Bild."""
     ext = image_path.suffix.lower()
     candidates = WORLD_FILE_EXT.get(ext, [])
     for wext in candidates:
@@ -231,17 +284,6 @@ def _find_world_file(image_path: Path) -> Optional[Path]:
 
 
 def _parse_world_file(wf_path: Path):
-    """
-    Liest ein World-File und gibt ein rasterio Affine-Transform zurück.
-
-    World-File Format (6 Zeilen):
-      A  = Pixel-Größe X (z.B. 0.002 m)
-      D  = Rotation Y (normalerweise 0)
-      B  = Rotation X (normalerweise 0)
-      E  = Pixel-Größe Y (negativ, z.B. -0.002 m)
-      C  = X-Koordinate obere linke Ecke
-      F  = Y-Koordinate obere linke Ecke
-    """
     if not HAS_RASTERIO:
         return None
     try:
@@ -249,7 +291,6 @@ def _parse_world_file(wf_path: Path):
         if len(lines) < 6:
             return None
         vals = [float(line.strip()) for line in lines[:6]]
-        # Affine(a, b, c, d, e, f) = Affine(pixel_x, rot_x, origin_x, rot_y, pixel_y, origin_y)
         return Affine(vals[0], vals[2], vals[4], vals[1], vals[3], vals[5])
     except Exception as e:
         print(f"[WARN] World-File Lesefehler ({wf_path.name}): {e}")
@@ -257,7 +298,6 @@ def _parse_world_file(wf_path: Path):
 
 
 def _read_prj_crs(image_path: Path):
-    """Liest CRS aus einer .prj Sidecar-Datei (WKT-Format)."""
     prj_path = image_path.with_suffix(".prj")
     if not prj_path.exists() or not HAS_RASTERIO:
         return None
@@ -272,17 +312,15 @@ def _read_prj_crs(image_path: Path):
 
 def load_geo_image(path: str) -> GeoImage:
     """
-    Lädt Bild mit optionalen Geo-Metadaten.
+    Laedt Bild mit optionalen Geo-Metadaten.
 
-    Geo-Quellen (in Prioritätsreihenfolge):
+    Prioritaet:
       1. Eingebettetes GeoTIFF (CRS + Transform im TIFF-Header)
-      2. GDAL-Sidecar: World-File (.jgw/.tfw/etc.) + .prj (automatisch via rasterio)
-      3. Manuelle Sidecar-Analyse als Fallback
-      4. Kein Geo → Pixel-Koordinaten
+      2. World-File (.jgw/.tfw/etc.) + .prj (via rasterio/GDAL)
+      3. PIL (Pixel-Koordinaten)
     """
     p = Path(path)
 
-    # ── Versuch 1: rasterio für ALLE Formate (GDAL liest GeoTIFF, World-Files, etc.) ──
     if HAS_RASTERIO:
         try:
             with rasterio.open(str(p)) as src:
@@ -292,7 +330,6 @@ def load_geo_image(path: str) -> GeoImage:
                     channels = channels * 3
                 image = np.dstack(channels)
 
-                # Normalisiere auf uint8 (GeoTIFF kann 16-bit, 32-bit float sein)
                 if image.dtype != np.uint8:
                     lo, hi = image.min(), image.max()
                     image = ((image.astype(np.float32) - lo) / (hi - lo + 1e-8) * 255).astype(np.uint8)
@@ -300,16 +337,13 @@ def load_geo_image(path: str) -> GeoImage:
                 transform = src.transform
                 crs = src.crs
 
-                # Prüfe ob rasterio/GDAL echte Geo-Daten erkannt hat
                 has_embedded_geo = (crs is not None and transform is not None)
 
                 if has_embedded_geo:
                     crs_label = crs.to_epsg() or crs.to_string()
-                    print(f"[INFO] Georeferenziert geladen: {src.width}×{src.height} px "
-                          f"| CRS: {crs_label}")
+                    print(f"[INFO] Georeferenziert: {src.width}x{src.height} px | CRS: {crs_label}")
                     return GeoImage(image, transform, crs, str(p))
 
-                # rasterio hat kein CRS → versuche Sidecar World-File + PRJ manuell
                 wf = _find_world_file(p)
                 if wf:
                     wf_transform = _parse_world_file(wf)
@@ -318,17 +352,15 @@ def load_geo_image(path: str) -> GeoImage:
                         crs_str = ""
                         if wf_crs:
                             crs_str = f" | CRS: {wf_crs.to_epsg() or wf_crs.to_string()}"
-                        print(f"[INFO] World-File geladen: {src.width}×{src.height} px"
-                              f"{crs_str} | {wf.name}")
+                        print(f"[INFO] World-File: {src.width}x{src.height} px{crs_str}")
                         return GeoImage(image, wf_transform, wf_crs, str(p))
 
-                print(f"[INFO] Bild geladen (ohne Geo): {src.width}×{src.height} px")
+                print(f"[INFO] Bild geladen (ohne Geo): {src.width}x{src.height} px")
                 return GeoImage(image, source_path=str(p))
 
         except Exception as e:
             print(f"[WARN] rasterio-Fehler, Fallback auf PIL: {e}")
 
-    # ── Versuch 2: PIL + manuelle World-File-Analyse ──────────────────────────
     pil = Image.open(str(p)).convert("RGB")
     image = np.array(pil)
 
@@ -340,46 +372,156 @@ def load_geo_image(path: str) -> GeoImage:
             crs_str = ""
             if wf_crs:
                 crs_str = f" | CRS: {wf_crs.to_epsg() or wf_crs.to_string()}"
-            print(f"[INFO] PIL + World-File: {pil.width}×{pil.height} px{crs_str}")
+            print(f"[INFO] PIL + World-File: {pil.width}x{pil.height} px{crs_str}")
             return GeoImage(image, wf_transform, wf_crs, str(p))
 
     return GeoImage(image, source_path=str(p))
 
 
-# ══════════════════════════════════════════════════════════════════════════════
+# ==============================================================================
 #  TILING
-# ══════════════════════════════════════════════════════════════════════════════
+# ==============================================================================
 
 def compute_tiles(
     w: int,
     h: int,
     tile_size: int = TILE_SIZE,
-    overlap: int = TILE_OVERLAP,
+    overlap_pct: float = TILE_OVERLAP_PCT,
 ) -> List[Tuple[int, int, int, int]]:
-    """Gibt Liste von (x0, y0, x1, y1) Kacheln zurück."""
-    stride = tile_size - overlap
-    tiles  = []
+    """
+    Gibt Liste von (x0, y0, x1, y1) Kacheln zurueck.
+    Randkacheln werden zurueckgesetzt, damit sie immer genau tile_size gross
+    sind (wenn moeglich) - verhindert das Abschneiden von Rissen am Rand.
+    """
+    overlap = max(64, int(tile_size * overlap_pct))
+    stride  = tile_size - overlap
+    tiles   = []
 
     y0 = 0
-    while y0 < h:
+    while True:
+        y1_raw = y0 + tile_size
+        # Randkachel: zuruecksetzen damit sie volle Hoehe hat
+        if y1_raw > h:
+            y0 = max(0, h - tile_size)
+            y1 = h
+        else:
+            y1 = y1_raw
+
         x0 = 0
-        while x0 < w:
-            x1 = min(x0 + tile_size, w)
-            y1 = min(y0 + tile_size, h)
-            tiles.append((x0, y0, x1, y1))
+        while True:
+            x1_raw = x0 + tile_size
+            if x1_raw > w:
+                x0 = max(0, w - tile_size)
+                x1 = w
+            else:
+                x1 = x1_raw
+
+            tile_entry = (x0, y0, x1, y1)
+            if tile_entry not in tiles:
+                tiles.append(tile_entry)
+
             if x1 >= w:
                 break
             x0 += stride
-        if y0 + stride >= h:
+
+        if y1 >= h:
             break
         y0 += stride
 
     return tiles
 
 
-# ══════════════════════════════════════════════════════════════════════════════
+# ==============================================================================
 #  ERKENNUNG (SAM3 TEXT-PROMPT)
-# ══════════════════════════════════════════════════════════════════════════════
+# ==============================================================================
+
+def _apply_closing(mask: np.ndarray, kernel_size: int = CLOSING_KERNEL_SIZE) -> np.ndarray:
+    """Morphologisches Closing: verbindet unterbrochene Riss-Segmente."""
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kernel_size, kernel_size))
+    return cv2.morphologyEx(mask.astype(np.uint8), cv2.MORPH_CLOSE, kernel).astype(bool)
+
+
+def _passes_aspect_ratio(mask: np.ndarray, min_ratio: float = ASPECT_RATIO_MIN) -> bool:
+    """
+    Prueft ob eine Maske eine Riss-typische Laengsform hat.
+    Masken deren Bounding-Box-Verhaeltnis unter min_ratio liegt (= runde Flecken)
+    werden verworfen.
+    """
+    ys, xs = np.where(mask)
+    if len(xs) == 0:
+        return False
+    bw = int(xs.max() - xs.min()) + 1
+    bh = int(ys.max() - ys.min()) + 1
+    if bw == 0 or bh == 0:
+        return False
+    ratio = max(bw, bh) / max(min(bw, bh), 1)
+    return ratio >= min_ratio
+
+
+# ==============================================================================
+#  U-NET ONNX INFERENZ
+# ==============================================================================
+
+_IMAGENET_MEAN = np.array([0.485, 0.456, 0.406], dtype=np.float32)
+_IMAGENET_STD  = np.array([0.229, 0.224, 0.225], dtype=np.float32)
+
+
+def detect_unet_tile(
+    tile_np: np.ndarray,
+    threshold: float = 0.50,
+    log_fn=None,
+) -> Tuple[List[np.ndarray], List[float]]:
+    """
+    Erkennt Risse via trainiertes U-Net ONNX Modell.
+    Eingabe: RGB-Bild als numpy array (H x W x 3).
+    Ausgabe: (masks, scores) - analog zu detect_in_tile.
+    """
+    global _unet_session
+
+    if _unet_session is None:
+        if log_fn:
+            log_fn("   [FEHLER] U-Net nicht geladen. Export zunaechst benoetigt.")
+        return [], []
+
+    h, w = tile_np.shape[:2]
+    target_size = 768   # muss zum Training-Config passen
+
+    # Preprocessing: resize + normalize (ImageNet stats)
+    resized = cv2.resize(tile_np, (target_size, target_size),
+                         interpolation=cv2.INTER_LINEAR).astype(np.float32) / 255.0
+    normalized = (resized - _IMAGENET_MEAN) / _IMAGENET_STD
+    tensor = normalized.transpose(2, 0, 1)[np.newaxis]  # (1, 3, H, W)
+
+    try:
+        input_name = _unet_session.get_inputs()[0].name
+        logits = _unet_session.run(None, {input_name: tensor})[0]  # (1, 1, H, W)
+    except Exception as exc:
+        if log_fn:
+            log_fn(f"   [FEHLER] U-Net Inferenz: {exc}")
+        return [], []
+
+    # Sigmoid + threshold -> binary mask
+    prob = 1.0 / (1.0 + np.exp(-logits[0, 0].astype(np.float64)))
+    binary = (prob > threshold).astype(bool)
+
+    # Rueck-skalieren auf originale Kachelgroesse
+    binary_resized = cv2.resize(
+        binary.astype(np.uint8), (w, h), interpolation=cv2.INTER_NEAREST
+    ).astype(bool)
+
+    if not np.any(binary_resized):
+        return [], []
+
+    # Confidence = mittlere Wahrscheinlichkeit im Rissbereich
+    prob_resized = cv2.resize(prob.astype(np.float32), (w, h), interpolation=cv2.INTER_LINEAR)
+    crack_probs = prob_resized[binary_resized]
+    score = float(np.mean(crack_probs))
+
+    # Morphologisches Closing um unterbrochene Linien zu verbinden
+    binary_resized = _apply_closing(binary_resized)
+
+    return [binary_resized], [score]
+
 
 def detect_in_tile(
     tile_np: np.ndarray,
@@ -390,32 +532,24 @@ def detect_in_tile(
     """
     Erkennt Risse in einem einzelnen Tile via SAM3 Text-Prompt.
 
-    Args:
-        tile_np       – RGB uint8 Array (H×W×3)
-        text_prompts  – Liste von Text-Prompts (z.B. ["crack", "fracture"])
-        confidence    – Confidence-Schwellwert für SAM3
-        log_fn        – Optionale Log-Funktion für Fehler/Debug-Ausgaben
-
     Returns:
-        masks  – Liste von bool-Masken (H×W)
-        scores – geschätzte Konfidenz-Scores
+        masks  - Liste von bool-Masken (H x W)
+        scores - geschaetzte Konfidenz-Scores
     """
     global _sam3_proc
 
     h, w = tile_np.shape[:2]
     pil_tile = Image.fromarray(tile_np)
 
-    # ── SAM3: Bild encodieren ─────────────────────────────────────────────
     try:
         state = _sam3_proc.set_image(pil_tile)
     except Exception as exc:
         msg = f"[FEHLER] SAM3 set_image: {exc}"
         print(msg)
         if log_fn:
-            log_fn(f"   ❌ {msg}")
+            log_fn(f"   {msg}")
         return [], []
 
-    # Temporär Confidence anpassen
     original_conf = None
     if hasattr(_sam3_proc, "confidence_threshold"):
         original_conf = _sam3_proc.confidence_threshold
@@ -429,13 +563,11 @@ def detect_in_tile(
             _sam3_proc.reset_all_prompts(state)
             result_state = _sam3_proc.set_text_prompt(prompt, state)
         except Exception as exc:
-            msg = f"[FEHLER] SAM3 Prompt '{prompt}': {exc}"
-            print(msg)
             if log_fn:
-                log_fn(f"   ❌ {msg}")
+                log_fn(f"   [FEHLER] SAM3 Prompt '{prompt}': {exc}")
             continue
 
-        raw_masks = result_state.get("masks")
+        raw_masks  = result_state.get("masks")
         raw_scores = result_state.get("scores")
 
         if raw_masks is None or (hasattr(raw_masks, "__len__") and len(raw_masks) == 0):
@@ -443,14 +575,13 @@ def detect_in_tile(
                 log_fn(f"   [SAM3] '{prompt}': 0 Masken (alle unter Schwellwert {confidence:.2f})")
             continue
 
-        n_raw = raw_masks.shape[0] if hasattr(raw_masks, 'shape') else len(raw_masks)
+        n_raw = raw_masks.shape[0] if hasattr(raw_masks, "shape") else len(raw_masks)
 
         if hasattr(raw_masks, "cpu"):
             raw_masks = raw_masks.cpu().numpy()
         if raw_scores is not None and hasattr(raw_scores, "cpu"):
             raw_scores = raw_scores.cpu().numpy()
 
-        # Masken auf Top-N nach Score begrenzen
         if n_raw > SAM3_MAX_MASKS_PER_TILE:
             top_idx    = np.argsort(raw_scores)[::-1][:SAM3_MAX_MASKS_PER_TILE]
             raw_masks  = raw_masks[top_idx]
@@ -458,43 +589,48 @@ def detect_in_tile(
             n_kept = SAM3_MAX_MASKS_PER_TILE
         else:
             n_kept = n_raw
+
         if log_fn:
-            log_fn(f"   [SAM3] '{prompt}': {n_raw} Masken über Schwellwert {confidence:.2f} (behalte Top-{n_kept})")
+            log_fn(f"   [SAM3] '{prompt}': {n_raw} Masken (behalte Top-{n_kept})")
+
         for i, m in enumerate(raw_masks):
-            # Dimensionen normalisieren
-            if m.ndim == 4:     # (1, 1, H, W)
+            if m.ndim == 4:
                 m = m[0, 0]
-            elif m.ndim == 3:   # (1, H, W)
+            elif m.ndim == 3:
                 m = m[0]
             if m.shape != (h, w):
-                m = cv2.resize(m.astype(np.float32), (w, h),
-                               interpolation=cv2.INTER_LINEAR)
+                m = cv2.resize(m.astype(np.float32), (w, h), interpolation=cv2.INTER_LINEAR)
 
             binary = (m > 0.5).astype(bool)
-            px = int(np.count_nonzero(binary))
+            px_count = int(np.count_nonzero(binary))
 
-            if px < SAM3_MIN_MASK_PX:
+            if px_count < SAM3_MIN_MASK_PX:
+                continue
+
+            # Morphologisches Closing
+            binary = _apply_closing(binary)
+
+            # Aspect-Ratio-Filter
+            if not _passes_aspect_ratio(binary):
                 continue
 
             score = float(raw_scores[i]) if raw_scores is not None and i < len(raw_scores) else confidence
             masks_out.append(binary)
             scores_out.append(score)
 
-    # SAM3 State freigeben
     del state
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
 
-    # Confidence zurücksetzen
     if original_conf is not None:
         _sam3_proc.confidence_threshold = original_conf
 
     return masks_out, scores_out
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-#  MASKE → POLYGON
-# ══════════════════════════════════════════════════════════════════════════════
+# ==============================================================================
+#  MASKE -> POLYGON
+# ==============================================================================
 
 def mask_to_polygon(
     mask: np.ndarray,
@@ -502,11 +638,11 @@ def mask_to_polygon(
     offset_y: int = 0,
     min_area: int = 100,
 ) -> Optional[object]:
-    """Konvertiert bool-Maske → Shapely-Polygon mit Kachel-Offset."""
+    """Konvertiert bool-Maske -> Shapely-Polygon mit Kachel-Offset."""
     if not HAS_SHAPELY:
         return None
 
-    mask_u8   = (mask.astype(np.uint8)) * 255
+    mask_u8 = (mask.astype(np.uint8)) * 255
     contours, _ = cv2.findContours(mask_u8, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
     if not contours:
@@ -516,8 +652,7 @@ def mask_to_polygon(
     if cv2.contourArea(largest) < min_area:
         return None
 
-    # Kontur vereinfachen
-    eps   = 0.002 * cv2.arcLength(largest, True)
+    eps    = 0.002 * cv2.arcLength(largest, True)
     approx = cv2.approxPolyDP(largest, eps, True)
 
     if len(approx) < 3:
@@ -539,21 +674,15 @@ def nms_polygons(
     scores: List[float],
     iou_threshold: float = 0.5,
 ) -> Tuple[List, List[float]]:
-    """IoU-basierte NMS mit STRtree-Spatial-Index – O(n log n) statt O(n²).
-
-    Returns:
-        keep_polys  – gefilterte Polygone
-        keep_scores – zugehörige Scores (gleiche Reihenfolge)
-    """
+    """IoU-basierte NMS mit STRtree-Spatial-Index."""
     if not polygons:
         return [], []
 
     from shapely.strtree import STRtree
 
-    # Größte zuerst (höchste Fläche = bevorzugt beibehalten)
-    order  = sorted(range(len(polygons)), key=lambda i: polygons[i].area, reverse=True)
-    polys  = [polygons[i] for i in order]
-    scrs   = [scores[i]   for i in order]
+    order = sorted(range(len(polygons)), key=lambda i: polygons[i].area, reverse=True)
+    polys = [polygons[i] for i in order]
+    scrs  = [scores[i]   for i in order]
 
     suppressed = [False] * len(polys)
     tree       = STRtree(polys)
@@ -561,7 +690,6 @@ def nms_polygons(
     for i, poly in enumerate(polys):
         if suppressed[i]:
             continue
-        # Kandidaten via Bounding-Box vorfiltern
         candidates = tree.query(poly)
         for j in candidates:
             if j <= i or suppressed[j]:
@@ -581,15 +709,14 @@ def nms_polygons(
     return keep_polys, keep_scores
 
 
-# ══════════════════════════════════════════════════════════════════════════════
+# ==============================================================================
 #  SKELETT-HILFSFUNKTIONEN
-# ══════════════════════════════════════════════════════════════════════════════
+# ==============================================================================
 
 def _thin_mask(mask: np.ndarray) -> np.ndarray:
     """Skeletonize a boolean mask. Returns uint8 1-pixel-wide skeleton."""
     if HAS_SKIMAGE:
         return _skimage_skeletonize(mask).astype(np.uint8)
-    # Morphological thinning fallback (Zhang-Suen-style via erosion chain)
     kernel = cv2.getStructuringElement(cv2.MORPH_CROSS, (3, 3))
     skel = np.zeros_like(mask, dtype=np.uint8)
     m = mask.astype(np.uint8).copy()
@@ -605,42 +732,44 @@ def _thin_mask(mask: np.ndarray) -> np.ndarray:
 
 
 def merge_overlapping_polygons(polygons: List) -> List:
-    """
-    Merge all overlapping / touching Shapely polygons into disjoint regions.
-    Uses a small buffer so adjacent cracks also fuse.
-    """
+    """Merge all overlapping/touching Shapely polygons into disjoint regions."""
     if not HAS_SHAPELY or not polygons:
         return polygons
 
     from shapely.ops import unary_union
     from shapely.geometry import MultiPolygon
 
-    buffered = [p.buffer(4) for p in polygons]        # grow 4 px
+    buffered = [p.buffer(5) for p in polygons]
     union    = unary_union(buffered)
 
     if union.is_empty:
         return []
 
-    geoms = list(union.geoms) if union.geom_type == "MultiPolygon" else [union]
-    shrunk = [g.buffer(-4) for g in geoms]            # shrink back
-    return [g for g in shrunk if g is not None and not g.is_empty and g.area > 0]
+    geoms  = list(union.geoms) if union.geom_type == "MultiPolygon" else [union]
+    shrunk = [g.buffer(-5) for g in geoms]
+    result = []
+    for g in shrunk:
+        if g is None or g.is_empty or g.area <= 0:
+            continue
+        if g.geom_type == "MultiPolygon":
+            result.extend([p for p in g.geoms if not p.is_empty and p.area > 0])
+        else:
+            result.append(g)
+    return result
 
 
 def polygon_to_crack_line(poly, canvas_h: int, canvas_w: int,
-                          min_length_px: int = 20) -> Optional[object]:
+                          min_length_px: int = 15) -> Optional[object]:
     """
     Convert a filled Shapely Polygon (crack region) into a skeleton LineString.
 
-    Steps:
-      1. Rasterise the polygon into a local binary mask
-      2. Skeletonise → 1-px-wide centre line
-      3. Sort skeleton pixels along their principal axis (PCA)
-      4. Douglas-Peucker simplification → compact LineString
+    1. Rasterise polygon into local binary mask
+    2. Skeletonise -> 1-px-wide centre line
+    3. Sort skeleton pixels along principal axis (PCA)
+    4. Douglas-Peucker simplification -> compact LineString
     """
     if not HAS_SHAPELY:
         return None
-
-    from shapely.geometry import LineString
 
     minx, miny, maxx, maxy = poly.bounds
     minx = max(0, int(minx) - 2)
@@ -651,7 +780,6 @@ def polygon_to_crack_line(poly, canvas_h: int, canvas_w: int,
     if bw < 2 or bh < 2:
         return None
 
-    # Rasterise polygon into local mask
     mask = np.zeros((bh, bw), dtype=np.uint8)
     ext  = np.array(
         [(int(x) - minx, int(y) - miny) for x, y in poly.exterior.coords],
@@ -659,32 +787,27 @@ def polygon_to_crack_line(poly, canvas_h: int, canvas_w: int,
     )
     cv2.fillPoly(mask, [ext], 1)
 
-    # Skeletonise
     skel = _thin_mask(mask.astype(bool))
     ys, xs = np.where(skel)
     if len(xs) < 3:
         return None
 
-    # Global pixel coords
     pts = np.column_stack([xs + minx, ys + miny]).astype(float)
 
-    # PCA-based ordering so points run along the crack, not random
     center   = pts.mean(axis=0)
     centered = pts - center
-    sample   = centered[: min(len(centered), 3000)]
+    sample   = centered[:min(len(centered), 3000)]
     _, _, Vt = np.linalg.svd(sample, full_matrices=False)
     axis     = Vt[0]
     order    = np.argsort(centered @ axis)
     ordered  = pts[order]
 
-    # Downsample to max 800 points before simplification
-    if len(ordered) > 800:
-        idx     = np.round(np.linspace(0, len(ordered) - 1, 800)).astype(int)
+    if len(ordered) > 1000:
+        idx     = np.round(np.linspace(0, len(ordered) - 1, 1000)).astype(int)
         ordered = ordered[idx]
 
-    # Douglas-Peucker
     cv_pts     = ordered.reshape(-1, 1, 2).astype(np.int32)
-    simplified = cv2.approxPolyDP(cv_pts, 3.0, closed=False)
+    simplified = cv2.approxPolyDP(cv_pts, 2.0, closed=False)
     if simplified is None or len(simplified) < 2:
         return None
     simplified = simplified.reshape(-1, 2)
@@ -694,135 +817,271 @@ def polygon_to_crack_line(poly, canvas_h: int, canvas_w: int,
     return line if line.length >= min_length_px else None
 
 
-def _geom_coords_and_closed(geom) -> Tuple[List[Tuple], bool]:
-    """Return (coords_list, is_closed) for Polygon or LineString."""
-    if hasattr(geom, "exterior"):           # Polygon
-        return list(geom.exterior.coords), True
-    if hasattr(geom, "coords"):             # LineString
-        return list(geom.coords), False
-    if hasattr(geom, "geoms"):              # Multi* – take longest part
-        longest = max(geom.geoms, key=lambda g: g.length)
-        return _geom_coords_and_closed(longest)
-    return [], False
+def compute_crack_width(poly, canvas_h: int, canvas_w: int) -> Tuple[float, float]:
+    """
+    Berechnet durchschnittliche und maximale Rissbreite via Distance Transform.
+
+    Gibt (width_avg_px, width_max_px) zurueck.
+    Die Breite entspricht dem 2-fachen der mittleren Distanz zum Maskenrand
+    an jedem Skelett-Pixel.
+    """
+    minx, miny, maxx, maxy = poly.bounds
+    minx = max(0, int(minx) - 2)
+    miny = max(0, int(miny) - 2)
+    maxx = min(canvas_w, int(maxx) + 3)
+    maxy = min(canvas_h, int(maxy) + 3)
+    bw, bh = maxx - minx, maxy - miny
+    if bw < 2 or bh < 2:
+        return 1.0, 1.0
+
+    mask = np.zeros((bh, bw), dtype=np.uint8)
+    ext  = np.array(
+        [(int(x) - minx, int(y) - miny) for x, y in poly.exterior.coords],
+        dtype=np.int32,
+    )
+    cv2.fillPoly(mask, [ext], 255)
+
+    dist = cv2.distanceTransform(mask, cv2.DIST_L2, 5)
+
+    skel = _thin_mask(mask.astype(bool))
+    skel_ys, skel_xs = np.where(skel)
+
+    if len(skel_xs) == 0:
+        return float(dist.max() * 2), float(dist.max() * 2)
+
+    skel_dists = dist[skel_ys, skel_xs]
+    width_avg  = float(np.mean(skel_dists) * 2)
+    width_max  = float(np.max(skel_dists) * 2)
+    return width_avg, width_max
 
 
-# ══════════════════════════════════════════════════════════════════════════════
+# ==============================================================================
+#  RISS-DATEN CONTAINER
+# ==============================================================================
+
+class CrackFeature:
+    """
+    Haelt alle Attribute eines erkannten Risses fuer GeoJSON-Export.
+    """
+    def __init__(
+        self,
+        geometry,         # Shapely LineString oder Polygon
+        score: float,
+        width_avg_px: float,
+        width_max_px: float,
+        source: str,
+    ):
+        self.geometry     = geometry
+        self.score        = score
+        self.width_avg_px = width_avg_px
+        self.width_max_px = width_max_px
+        self.source       = source
+        self.detected_at  = _dt.datetime.now().isoformat(timespec="seconds")
+
+
+# ==============================================================================
 #  HAUPT-PIPELINE
-# ══════════════════════════════════════════════════════════════════════════════
+# ==============================================================================
 
 def _parse_prompts(text_prompt: str) -> List[str]:
-    """Parst den Text-Prompt in eine Liste einzelner Prompts.
-    
-    Eingabe: "crack . fracture . fissure"
-    Ausgabe: ["crack", "fracture", "fissure"]
-    """
     parts = [p.strip() for p in text_prompt.split(".")]
     return [p for p in parts if p]
 
 
-def process_geo_image(
-    geo_image: GeoImage,
-    text_prompt: str     = "crack",
-    confidence: float    = 0.05,
-    min_area: int        = 100,
-    progress_cb=None,
+def _run_scale(
+    img: np.ndarray,
+    tile_size: int,
+    text_prompts: List[str],
+    confidence: float,
+    min_area: int,
     log_fn=None,
-) -> Tuple[np.ndarray, List, List[float]]:
+    progress_cb=None,
+    scale_label: str = "",
+    pct_start: float = 0.0,
+    pct_end: float = 0.8,
+    use_unet: bool = False,
+) -> Tuple[List, List[float]]:
     """
-    Verarbeitet ein GeoImage komplett (mit automatischem Tiling).
-
-    Returns:
-        annotated_np  – Bild mit blauem Overlay (H×W×3 uint8)
-        polygons      – Liste von Shapely-Polygonen (Pixel-Koordinaten)
-        scores        – Konfidenz-Scores
+    Fuhrt einen vollstaendigen Tiling-Durchlauf auf `img` durch.
+    Gibt (polygons, scores) zurueck.
+    use_unet=True -> U-Net ONNX statt SAM3
     """
-    img  = geo_image.image
     h, w = img.shape[:2]
-
-    text_prompts = _parse_prompts(text_prompt)
-    if not text_prompts:
-        text_prompts = ["crack"]
-
-    all_polygons: List = []
-    all_scores:  List[float] = []
 
     needs_tiling = max(w, h) > MAX_DIRECT_SIZE
 
-    if needs_tiling:
-        tiles = compute_tiles(w, h)
-        print(f"[INFO] Tiling: {len(tiles)} Kacheln für {w}×{h} px")
+    all_polygons: List = []
+    all_scores: List[float] = []
 
-        _tile_masks_total = 0
+    if needs_tiling:
+        tiles = compute_tiles(w, h, tile_size=tile_size)
+        prefix = f"[{scale_label}] " if scale_label else ""
+        if log_fn:
+            log_fn(f"   {prefix}Tiling: {len(tiles)} Kacheln fuer {w}x{h} px")
+
+        raw_total = 0
         for i, (x0, y0, x1, y1) in enumerate(tiles):
+            pct = pct_start + (pct_end - pct_start) * i / len(tiles)
             if progress_cb:
-                progress_cb(i / len(tiles), f"Kachel {i+1}/{len(tiles)}")
+                progress_cb(pct, f"{prefix}Kachel {i+1}/{len(tiles)}")
+
             tile = img[y0:y1, x0:x1]
-            # log_fn nur für erste Kachel (Fehler sichtbar, kein Log-Flut)
-            tile_log = log_fn if i == 0 else None
-            masks, scores = detect_in_tile(tile, text_prompts, confidence, log_fn=tile_log)
-            _tile_masks_total += len(masks)
+            if use_unet:
+                masks, scores = detect_unet_tile(tile, threshold=confidence, log_fn=log_fn)
+            else:
+                masks, scores = detect_in_tile(tile, text_prompts, confidence, log_fn=log_fn)
+            raw_total += len(masks)
             for mask, score in zip(masks, scores):
                 poly = mask_to_polygon(mask, offset_x=x0, offset_y=y0, min_area=min_area)
                 if poly is not None:
                     all_polygons.append(poly)
                     all_scores.append(score)
+
         if log_fn:
-            if _tile_masks_total == 0:
-                log_fn(f"   ⚠ Alle {len(tiles)} Kacheln: 0 Masken — Confidence ({confidence:.2f}) weiter senken (min. 0.01)")
+            if raw_total == 0:
+                log_fn(f"   {prefix}0 Masken - Confidence ({confidence:.2f}) weiter senken")
             else:
-                log_fn(f"   [Tiling] {len(tiles)} Kacheln, {_tile_masks_total} Roh-Masken gefunden")
+                log_fn(f"   {prefix}{raw_total} Roh-Masken -> {len(all_polygons)} Polygone")
     else:
-        print(f"[INFO] Direkt: {w}×{h} px")
+        if log_fn and scale_label:
+            log_fn(f"   [{scale_label}] Direkt: {w}x{h} px")
         if progress_cb:
-            progress_cb(0.2, "Erkenne Risse ...")
-        masks, scores = detect_in_tile(img, text_prompts, confidence, log_fn=log_fn)
+            progress_cb(pct_start + (pct_end - pct_start) * 0.2, "Erkenne Risse ...")
+        if use_unet:
+            masks, scores = detect_unet_tile(img, threshold=confidence, log_fn=log_fn)
+        else:
+            masks, scores = detect_in_tile(img, text_prompts, confidence, log_fn=log_fn)
         if log_fn and len(masks) == 0:
-            log_fn(f"   ⚠ 0 Masken erkannt — Confidence ({confidence:.2f}) weiter senken (Slider bis 0.01)")
+            log_fn(f"   0 Masken erkannt - Confidence ({confidence:.2f}) weiter senken")
         for mask, score in zip(masks, scores):
             poly = mask_to_polygon(mask, min_area=min_area)
             if poly is not None:
                 all_polygons.append(poly)
                 all_scores.append(score)
 
-    # NMS nach Tiling (aggressiv: iou_threshold 0.3)
+    return all_polygons, all_scores
+
+
+def process_geo_image(
+    geo_image: GeoImage,
+    text_prompt: str     = "crack",
+    confidence: float    = SAM3_CONFIDENCE,
+    min_area: int        = 100,
+    tile_size: int       = TILE_SIZE,
+    multi_scale: bool    = True,
+    use_unet: bool       = False,
+    progress_cb=None,
+    log_fn=None,
+) -> Tuple[np.ndarray, List[CrackFeature]]:
+    """
+    Verarbeitet ein GeoImage komplett.
+
+    Returns:
+        annotated_np   - Bild mit farbigem Overlay (H x W x 3 uint8)
+        crack_features - Liste von CrackFeature-Objekten
+    """
+    img  = geo_image.image
+    h, w = img.shape[:2]
+    pixel_size_m = geo_image.pixel_size_m()
+
+    text_prompts = _parse_prompts(text_prompt)
+    if not text_prompts:
+        text_prompts = ["crack"]
+
+    # --- Scale 1: Normales Tiling ---
+    pct_s1_end = 0.55 if multi_scale else 0.80
+    if use_unet and log_fn:
+        log_fn("   [U-Net] Trainiertes Modell aktiv (ONNX)")
+    elif log_fn:
+        log_fn("   [SAM3] Foundation Model aktiv")
+
+    polys1, scores1 = _run_scale(
+        img, tile_size, text_prompts, confidence, min_area,
+        log_fn=log_fn, progress_cb=progress_cb,
+        scale_label="Scale 1", pct_start=0.05, pct_end=pct_s1_end,
+        use_unet=use_unet,
+    )
+
+    # --- Scale 2: Halbe Kachelgroesse fuer feine Risse ---
+    polys2:  List = []
+    scores2: List[float] = []
+    if multi_scale:
+        small_tile = max(256, tile_size // 2)
+        if log_fn:
+            log_fn(f"   [Scale 2] Feiner Durchlauf mit Kachelgroesse {small_tile} px ...")
+        polys2, scores2 = _run_scale(
+            img, small_tile, text_prompts, confidence, min_area,
+            log_fn=log_fn, progress_cb=progress_cb,
+            scale_label="Scale 2", pct_start=pct_s1_end, pct_end=0.80,
+            use_unet=use_unet,
+        )
+
+    all_polygons = polys1 + polys2
+    all_scores   = scores1 + scores2
+
+    # --- NMS ---
     if HAS_SHAPELY and len(all_polygons) > 1:
         if progress_cb:
-            progress_cb(0.82, f"NMS: {len(all_polygons)} Masken deduplizieren …")
+            progress_cb(0.81, f"NMS: {len(all_polygons)} Masken ...")
         before = len(all_polygons)
         all_polygons, all_scores = nms_polygons(all_polygons, all_scores, iou_threshold=0.3)
         removed = before - len(all_polygons)
-        if removed > 0:
-            print(f"[INFO] NMS: {removed} Duplikate entfernt → {len(all_polygons)} Risse")
+        if removed > 0 and log_fn:
+            log_fn(f"   NMS: {removed} Duplikate entfernt -> {len(all_polygons)} Risse")
 
-    # ── Überlappende Regionen zusammenführen ──────────────────────────────────
+    # --- Regionen zusammenfuehren ---
     if HAS_SHAPELY and len(all_polygons) > 1:
         if progress_cb:
-            progress_cb(0.87, f"Regionen zusammenführen: {len(all_polygons)} …")
+            progress_cb(0.85, f"Regionen zusammenfuehren ...")
         before = len(all_polygons)
         all_polygons = merge_overlapping_polygons(all_polygons)
         all_scores   = [1.0] * len(all_polygons)
-        if before != len(all_polygons):
-            print(f"[INFO] Merge: {before} → {len(all_polygons)} Riss-Regionen")
+        if before != len(all_polygons) and log_fn:
+            log_fn(f"   Merge: {before} -> {len(all_polygons)} Riss-Regionen")
 
-    # ── Polygone → Skelett-Linien ─────────────────────────────────────────────
+    # --- Polygone -> Kontur-Linien (Umrandung) + Breite ---
     n_polys = len(all_polygons)
     if progress_cb:
-        progress_cb(0.92, f"Skelettierung: 0/{n_polys} …")
+        progress_cb(0.87, f"Konturen: {n_polys} Regionen ...")
 
-    crack_lines: List = []   # LineString oder Polygon als Fallback
-    _report_every = max(1, n_polys // 20)   # max. 20 Status-Updates
-    for skel_i, poly in enumerate(all_polygons):
-        line = polygon_to_crack_line(poly, h, w)
-        crack_lines.append(line if line is not None else poly)
+    crack_features: List[CrackFeature] = []
+    _report_every = max(1, n_polys // 10)
+
+    for skel_i, (poly, score) in enumerate(zip(all_polygons, all_scores)):
+        if hasattr(poly, 'area') and poly.area > SAM3_MAX_POLY_AREA:
+            if log_fn:
+                log_fn(f"   [Skip] Polygon {skel_i+1} zu gross ({int(poly.area):,} px^2) - uebersprungen")
+            continue
+
+        # Use the polygon boundary (outline) as the exported geometry
+        try:
+            outline = LineString(poly.exterior.coords)
+        except Exception:
+            outline = poly
+
+        # Rissbreite berechnen
+        try:
+            w_avg, w_max = compute_crack_width(poly, h, w)
+        except Exception:
+            w_avg, w_max = 1.0, 1.0
+
+        crack_features.append(CrackFeature(
+            geometry     = outline,
+            score        = score,
+            width_avg_px = w_avg,
+            width_max_px = w_max,
+            source       = Path(geo_image.source_path).name,
+        ))
+
         if progress_cb and n_polys > 0 and skel_i % _report_every == 0:
-            pct = 0.92 + 0.05 * skel_i / n_polys
-            progress_cb(pct, f"Skelettierung: {skel_i + 1}/{n_polys} …")
+            pct = 0.87 + 0.08 * skel_i / n_polys
+            progress_cb(pct, f"Konturen: {skel_i+1}/{n_polys} ...")
 
-    print(f"[INFO] {len(crack_lines)} Risslinien nach Skelettierung")
+    print(f"[INFO] {len(crack_features)} Riss-Konturen erstellt")
 
-    # ── Bild skalieren, dann Risslinien einzeichnen ───────────────────────────
+    # --- Render: Farbiges Overlay ---
     if progress_cb:
-        progress_cb(0.97, "Bild mit Risslinien rendern …")
+        progress_cb(0.96, "Bild mit Riss-Konturen rendern ...")
 
     MAX_PREVIEW = 2000
     if max(h, w) > MAX_PREVIEW:
@@ -833,60 +1092,109 @@ def process_geo_image(
         coord_scale = 1.0
         render = img.copy()
 
-    CRACK_COLOR = (50, 50, 255)   # Blau (RGB)
-    LINE_THICK  = 3
+    rh, rw = render.shape[:2]
+
+    # Rissmasken als rotes semi-transparentes Overlay zeichnen
+    overlay = render.copy()
+
+    MASK_COLOR  = (50, 100, 220)   # Blau (RGB)
+    LINE_COLOR  = (60, 120, 255)   # Hellblau (RGB)
+    NUM_COLOR   = (255, 255, 255) # Weiss
+    LINE_THICK  = 1
+    ALPHA       = 0.40
 
     def _scaled_pts(coords):
         arr = np.array(coords, dtype=np.float32) * coord_scale
         return arr.astype(np.int32).reshape(-1, 1, 2)
 
-    for obj in crack_lines:
+    # Zuerst alle Masken als gefuellte Polygone zeichnen
+    for feat in crack_features:
+        obj = feat.geometry
+        if obj is None:
+            continue
+        try:
+            if hasattr(obj, "exterior"):    # Polygon
+                pts = _scaled_pts(list(obj.exterior.coords))
+                cv2.fillPoly(overlay, [pts], MASK_COLOR)
+        except Exception:
+            pass
+
+    # Overlay einblenden
+    render = cv2.addWeighted(overlay, ALPHA, render, 1.0 - ALPHA, 0)
+
+    # Dann Kontur-Linien in Gelb darueber
+    for idx, feat in enumerate(crack_features):
+        obj = feat.geometry
         if obj is None:
             continue
         try:
             if hasattr(obj, "geoms"):
                 for part in obj.geoms:
-                    cv2.polylines(render, [_scaled_pts(list(part.coords))], False, CRACK_COLOR, LINE_THICK)
-            elif hasattr(obj, "coords"):
-                cv2.polylines(render, [_scaled_pts(list(obj.coords))], False, CRACK_COLOR, LINE_THICK)
-            else:
-                cv2.polylines(render, [_scaled_pts(list(obj.exterior.coords))], True, CRACK_COLOR, LINE_THICK)
+                    cv2.polylines(render, [_scaled_pts(list(part.coords))], False, LINE_COLOR, LINE_THICK)
+            elif hasattr(obj, "coords"):    # LineString
+                pts = _scaled_pts(list(obj.coords))
+                cv2.polylines(render, [pts], False, LINE_COLOR, LINE_THICK)
+                # Riss-Nummer an Mittelpunkt
+                mid_idx = len(pts) // 2
+                mx, my = int(pts[mid_idx][0][0]), int(pts[mid_idx][0][1])
+                cv2.putText(render, str(idx + 1), (mx + 3, my - 3),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.35, NUM_COLOR, 1, cv2.LINE_AA)
+            elif hasattr(obj, "exterior"):  # Polygon-Fallback
+                pts = _scaled_pts(list(obj.exterior.coords))
+                cv2.polylines(render, [pts], True, LINE_COLOR, LINE_THICK)
+                cx = int(np.mean([p[0][0] for p in pts]))
+                cy = int(np.mean([p[0][1] for p in pts]))
+                cv2.putText(render, str(idx + 1), (cx + 3, cy - 3),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.35, NUM_COLOR, 1, cv2.LINE_AA)
         except Exception:
             pass
 
-    return render, crack_lines, all_scores
+    # Legende einzeichnen
+    legend_y = rh - 10
+    cv2.rectangle(render, (8, legend_y - 32), (200, legend_y + 2), (20, 20, 20), -1)
+    cv2.rectangle(render, (12, legend_y - 28), (24, legend_y - 18), MASK_COLOR, -1)
+    cv2.putText(render, "Rissflaeche", (28, legend_y - 18),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.38, (230, 230, 230), 1, cv2.LINE_AA)
+    cv2.line(render, (12, legend_y - 8), (24, legend_y - 8), LINE_COLOR, 2)
+    cv2.putText(render, "Mittellinie", (28, legend_y - 4),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.38, (230, 230, 230), 1, cv2.LINE_AA)
+
+    return render, crack_features
 
 
-# ══════════════════════════════════════════════════════════════════════════════
+# ==============================================================================
 #  EXPORT
-# ══════════════════════════════════════════════════════════════════════════════
+# ==============================================================================
 
 def export_geojson(
-    entries: List[Tuple[GeoImage, List]],
+    entries: List[Tuple[GeoImage, List[CrackFeature]]],
     output_path: str,
 ) -> str:
     """
-    Exportiert Crack-Linien/-Polygone aller Bilder als GeoJSON.
-    Geometrien: LineString (Skelett) oder Polygon-Fallback.
-    Koordinaten: Weltkoordinaten wenn GeoTIFF, sonst Pixel-Koordinaten.
+    Exportiert Crack-Linien/-Polygone als GeoJSON mit erweiterten Attributen:
+    - id, source_file, type
+    - length_px, length_m (falls GeoTIFF)
+    - width_avg_px, width_max_px, width_avg_m, width_max_m
+    - confidence, detection_date, has_geo, crs
     """
     if not HAS_SHAPELY:
         raise RuntimeError("shapely nicht installiert")
 
-    from shapely.geometry import LineString as _LS
-
     features = []
-    for geo_image, geoms in entries:
-        for geom in geoms:
+    for geo_image, crack_features in entries:
+        pixel_m = geo_image.pixel_size_m()
+
+        for feat in crack_features:
+            geom = feat.geometry
             if geom is None:
                 continue
 
-            # Koordinaten in Weltkoordinaten umrechnen (falls GeoTIFF)
+            # Koordinaten in Weltkoordinaten umrechnen
             if geo_image.has_geo:
-                if hasattr(geom, "coords"):            # LineString
+                if hasattr(geom, "coords"):
                     wc = geo_image.coords_to_world(list(geom.coords))
-                    export_geom = _LS(wc)
-                elif hasattr(geom, "exterior"):        # Polygon
+                    export_geom = LineString(wc)
+                elif hasattr(geom, "exterior"):
                     wc = geo_image.coords_to_world(list(geom.exterior.coords))
                     from shapely.geometry import Polygon as _Poly
                     export_geom = _Poly(wc)
@@ -895,26 +1203,36 @@ def export_geojson(
             else:
                 export_geom = geom
 
-            length_px = geom.length if hasattr(geom, "length") else 0.0
+            length_px = float(geom.length) if hasattr(geom, "length") else 0.0
 
-            feature = {
-                "type": "Feature",
-                "geometry": mapping(export_geom),
-                "properties": {
-                    "id":          len(features) + 1,
-                    "source_file": Path(geo_image.source_path).name,
-                    "length_px":   round(length_px, 2),
-                    "has_geo":     geo_image.has_geo,
-                },
+            props: Dict[str, Any] = {
+                "id":           len(features) + 1,
+                "source_file":  feat.source,
+                "type":         "crack",
+                "length_px":    round(length_px, 2),
+                "width_avg_px": round(feat.width_avg_px, 2),
+                "width_max_px": round(feat.width_max_px, 2),
+                "confidence":   round(feat.score, 4),
+                "detection_date": feat.detected_at,
+                "has_geo":      geo_image.has_geo,
             }
+
+            if pixel_m is not None and pixel_m > 0:
+                props["length_m"]    = round(length_px * pixel_m, 4)
+                props["width_avg_m"] = round(feat.width_avg_px * pixel_m, 4)
+                props["width_max_m"] = round(feat.width_max_px * pixel_m, 4)
+
             if geo_image.has_geo and geo_image.crs:
-                feature["properties"]["crs"] = geo_image.crs.to_string()
+                props["crs"] = geo_image.crs.to_string()
 
-            features.append(feature)
+            features.append({
+                "type":       "Feature",
+                "geometry":   mapping(export_geom),
+                "properties": props,
+            })
 
-    doc = {"type": "FeatureCollection", "features": features}
+    doc: Dict[str, Any] = {"type": "FeatureCollection", "features": features}
 
-    # CRS auf FeatureCollection-Ebene (vom ersten GeoTIFF)
     for geo_image, _ in entries:
         if geo_image.has_geo and geo_image.crs:
             doc["crs"] = {"type": "name", "properties": {"name": geo_image.crs.to_string()}}
@@ -927,83 +1245,62 @@ def export_geojson(
 
 
 def export_dxf(
-    entries: List[Tuple[GeoImage, List]],
+    entries: List[Tuple[GeoImage, List[CrackFeature]]],
     output_path: str,
 ) -> str:
-    """
-    Exportiert Polygone als DXF R2010.
-    Layer CRACKS: Polygone als LWPOLYLINE (rot)
-    Layer CRACK_LABELS: Beschriftungen (grün)
-    """
+    """Exportiert Polygone/Linien als DXF R2010."""
     if not HAS_EZDXF:
         raise RuntimeError("ezdxf nicht installiert")
     if not HAS_SHAPELY:
         raise RuntimeError("shapely nicht installiert")
 
     doc = ezdxf.new(dxfversion="R2010")
-    # Einheiten nur auf Meter setzen wenn mindestens ein Bild Geo-Daten hat
     has_any_geo = any(gi.has_geo for gi, _ in entries)
     if has_any_geo:
-        doc.header["$INSUNITS"] = 6  # Meter
+        doc.header["$INSUNITS"] = 6
 
-    doc.layers.add("CRACKS",       color=1)   # ACI rot
-    doc.layers.add("CRACK_LABELS", color=3)   # ACI grün
+    doc.layers.add("CRACKS",       color=1)
+    doc.layers.add("CRACK_LABELS", color=3)
 
     msp      = doc.modelspace()
     crack_id = 1
 
-    for geo_image, geoms in entries:
+    for geo_image, crack_features in entries:
         has_geo = geo_image.has_geo
 
-        for geom in geoms:
+        for feat in crack_features:
+            geom = feat.geometry
             if geom is None:
                 continue
 
-            # Koordinaten ermitteln (LineString oder Polygon)
-            if hasattr(geom, "coords"):             # LineString
+            if hasattr(geom, "coords"):
                 raw_coords = list(geom.coords)
-                is_closed   = False
-                mid_px      = raw_coords[len(raw_coords) // 2]
-            elif hasattr(geom, "exterior"):         # Polygon
+                is_closed  = False
+                mid_px     = raw_coords[len(raw_coords) // 2]
+            elif hasattr(geom, "exterior"):
                 raw_coords = list(geom.exterior.coords)
-                is_closed   = True
-                cx_px, cy_px = geom.centroid.x, geom.centroid.y
-                mid_px       = (cx_px, cy_px)
+                is_closed  = True
+                mid_px     = (geom.centroid.x, geom.centroid.y)
             else:
                 continue
 
-            if has_geo:
-                world = geo_image.coords_to_world(raw_coords)
-            else:
-                world = raw_coords
+            world = geo_image.coords_to_world(raw_coords) if has_geo else raw_coords
+            pts_2d = [(float(x), float(y)) for x, y in world]
 
-            pts_3d = [(float(x), float(y), 0.0) for x, y in world]
-
-            # LWPOLYLINE (open for lines, closed for polygon fallback)
             msp.add_lwpolyline(
-                pts_3d,
-                dxfattribs={
-                    "layer":  "CRACKS",
-                    "closed": is_closed,
-                    "color":  1,
-                },
+                pts_2d,
+                dxfattribs={"layer": "CRACKS", "closed": is_closed, "color": 1},
             )
 
-            # Label-Position
             cx_px, cy_px = float(mid_px[0]), float(mid_px[1])
             if has_geo:
                 cx_px, cy_px = geo_image.px_to_world(cx_px, cy_px)
 
             label_height = 0.1 if has_geo else 20
-
             msp.add_text(
                 f"Riss {crack_id}",
-                dxfattribs={
-                    "layer":  "CRACK_LABELS",
-                    "height": label_height,
-                    "insert": (cx_px, cy_px),
-                    "color":  3,
-                },
+                dxfattribs={"layer": "CRACK_LABELS", "height": label_height,
+                            "insert": (cx_px, cy_px), "color": 3},
             )
             crack_id += 1
 
@@ -1011,49 +1308,44 @@ def export_dxf(
     return output_path
 
 
-# ══════════════════════════════════════════════════════════════════════════════
+# ==============================================================================
 #  PROMPT-VORLAGEN
-# ══════════════════════════════════════════════════════════════════════════════
+# ==============================================================================
 
 PROMPT_PRESETS = {
-    "Strassenrisse":    "crack . pavement crack . fissure",
-    "Betonrisse":       "crack . concrete crack . spalling",
-    "Mauerwerk":        "crack . fracture . masonry crack",
-    "Fassade":          "crack . facade crack . plaster crack",
-    "Bruecke":          "crack . structural crack . fracture . spalling",
+    "Strassenrisse":     "crack . pavement crack . fissure",
+    "Betonrisse":        "crack . concrete crack . spalling",
+    "Mauerwerk":         "crack . fracture . masonry crack",
+    "Fassade":           "crack . facade crack . plaster crack",
+    "Bruecke":           "crack . structural crack . fracture . spalling",
     "Benutzerdefiniert": "",
 }
 
 PROMPT_PRESET_NAMES = list(PROMPT_PRESETS.keys())
-DEFAULT_PRESET = PROMPT_PRESET_NAMES[0]
+DEFAULT_PRESET      = PROMPT_PRESET_NAMES[0]
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-#  DESKTOP APP (customtkinter)
-# ══════════════════════════════════════════════════════════════════════════════
+# ==============================================================================
+#  APPEARANCE
+# ==============================================================================
 
-
-import datetime as _dt
-
-
-# ─── Appearance ───────────────────────────────────────────────────────────────
 APP_COLORS = {
-    "bg":         "#0d0d1a",
-    "panel":      "#16213e",
-    "accent":     "#0f3460",
-    "highlight":  "#e94560",
-    "hover":      "#c73652",
-    "text":       "#eaeaea",
-    "text_dim":   "#a0a0b0",
-    "success":    "#4ade80",
-    "warning":    "#fbbf24",
-    "error":      "#f87171",
+    "bg":        "#0d0d1a",
+    "panel":     "#16213e",
+    "accent":    "#0f3460",
+    "highlight": "#e94560",
+    "hover":     "#c73652",
+    "text":      "#eaeaea",
+    "text_dim":  "#a0a0b0",
+    "success":   "#4ade80",
+    "warning":   "#fbbf24",
+    "error":     "#f87171",
 }
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
+# ==============================================================================
 #  PROCESSING WORKER
-# ═══════════════════════════════════════════════════════════════════════════════
+# ==============================================================================
 
 class Worker:
     """Runs crack detection in a background thread, sends messages via queue."""
@@ -1062,7 +1354,6 @@ class Worker:
         self._q          = msg_q
         self._stop_event = threading.Event()
 
-    # ── helpers ───────────────────────────────────────────────────────────────
     def _log(self, text: str):
         self._q.put(("log", text))
 
@@ -1081,7 +1372,6 @@ class Worker:
     def stop(self):
         self._stop_event.set()
 
-    # ── main entry point ──────────────────────────────────────────────────────
     def run(
         self,
         image_paths: List[Path],
@@ -1089,25 +1379,26 @@ class Worker:
         custom_prompt: str,
         confidence: float,
         min_area: int,
+        tile_size: int,
+        multi_scale: bool,
+        use_unet: bool = False,
     ):
         self._stop_event.clear()
 
-        # Build prompt
         if preset == "Benutzerdefiniert":
             text_prompt = custom_prompt.strip() or "crack"
         else:
-            base = PROMPT_PRESETS.get(preset, "crack")
+            base        = PROMPT_PRESETS.get(preset, "crack")
             text_prompt = f"{base} . {custom_prompt.strip()}" if custom_prompt.strip() else base
 
-        # Output folder next to first input file
         input_dir  = image_paths[0].parent
         output_dir = input_dir / "output"
         output_dir.mkdir(parents=True, exist_ok=True)
         self._log(f"Output-Ordner: {output_dir}")
 
-        total = len(image_paths)
-        all_entries: List[Tuple[GeoImage, List]] = []
-        t_start = time.time()
+        total     = len(image_paths)
+        all_entries: List[Tuple[GeoImage, List[CrackFeature]]] = []
+        t_start   = time.time()
 
         for idx, img_path in enumerate(image_paths):
             if self._stop_event.is_set():
@@ -1116,120 +1407,172 @@ class Worker:
                 return
 
             pct_base = idx / total
-            self._status(f"Lade {img_path.name} …")
+            self._status(f"Lade {img_path.name} ...")
             self._progress(pct_base * 0.05)
             self._log(f"\n>> {img_path.name}")
 
             try:
                 geo_image = load_geo_image(str(img_path))
-                geo_flag = ""
+                geo_flag  = ""
                 if geo_image.has_geo:
                     epsg     = geo_image.crs.to_epsg() if geo_image.crs else "?"
-                    geo_flag = f" | EPSG:{epsg}"
-                self._log(f"   {geo_image.width}×{geo_image.height} px{geo_flag}")
+                    px_m     = geo_image.pixel_size_m()
+                    px_str   = f" | {px_m*100:.1f} cm/px" if px_m else ""
+                    geo_flag = f" | EPSG:{epsg}{px_str}"
+                self._log(f"   {geo_image.width}x{geo_image.height} px{geo_flag}")
 
-                _tile_start   = time.time()
-                _crack_count  = [0]
+                _tile_start  = time.time()
+                _crack_count = [0]
 
                 def _tile_cb(tile_pct: float, tile_msg: str):
                     if self._stop_event.is_set():
                         return
-                    if tile_pct >= 0.90:
-                        overall = pct_base * 0.97 + (0.90 + (tile_pct - 0.90) * 0.7) * (0.97 / total)
-                        self._status(f"{img_path.name}: {tile_msg}")
-                        self._progress(overall)
-                        return
                     elapsed = time.time() - _tile_start
                     if tile_pct > 0.02 and elapsed > 2:
-                        eta_s  = (elapsed / tile_pct) * (1.0 - tile_pct)
-                        m, s   = divmod(int(eta_s), 60)
-                        h_, m  = divmod(m, 60)
-                        if h_ > 0:   eta = f"~{h_}h {m:02d}m verbleibend"
-                        elif m > 0:  eta = f"~{m}m {s:02d}s verbleibend"
-                        else:        eta = f"~{s}s verbleibend"
+                        eta_s = (elapsed / tile_pct) * (1.0 - tile_pct)
+                        m, s  = divmod(int(eta_s), 60)
+                        h_, m = divmod(m, 60)
+                        if h_ > 0:   eta = f"~{h_}h {m:02d}m"
+                        elif m > 0:  eta = f"~{m}m {s:02d}s"
+                        else:        eta = f"~{s}s"
                     else:
                         eta = ""
+
                     overall = pct_base * 0.97 + tile_pct / total * 0.90
                     msg = f"{img_path.name}: {tile_msg} | {_crack_count[0]} Risse"
                     if eta:
-                        msg += f" | {eta}"
+                        msg += f" | {eta} verbleibend"
                     self._status(msg)
                     self._progress(overall)
 
-                annotated, crack_lines, scores = process_geo_image(
+                annotated, crack_features = process_geo_image(
                     geo_image,
                     text_prompt  = text_prompt,
                     confidence   = confidence,
                     min_area     = min_area,
+                    tile_size    = tile_size,
+                    multi_scale  = multi_scale,
+                    use_unet     = use_unet,
                     progress_cb  = _tile_cb,
                     log_fn       = self._log,
                 )
 
-                _crack_count[0] = len(crack_lines)
+                _crack_count[0] = len(crack_features)
                 elapsed_img     = time.time() - _tile_start
 
                 self._progress((pct_base + 1.0 / total) * 0.97)
-                self._status(f"✅ {img_path.name}: {len(crack_lines)} Risse in {elapsed_img:.1f}s")
-                self._log(f"   ✅ {len(crack_lines)} Risse erkannt in {elapsed_img:.1f}s")
+                self._status(f"{img_path.name}: {len(crack_features)} Risse in {elapsed_img:.1f}s")
+                self._log(f"   {len(crack_features)} Risse erkannt in {elapsed_img:.1f}s")
 
-                # ── Vorschau anzeigen ─────────────────────────────────────────
+                # Vorschau
                 self._preview(annotated)
 
-                # ── Bild mit Markierungen speichern ───────────────────────────
-                # `annotated` ist bereits skaliert (max 2000 px) und hat blaue
-                # Risslinien eingezeichnet → direkt speichern, kein Re-Render.
+                # Bild speichern
                 stem    = img_path.stem
                 out_img = output_dir / f"{stem}_cracks.png"
-                self._status(f"Speichere {out_img.name} …")
+                self._status(f"Speichere {out_img.name} ...")
                 Image.fromarray(annotated).save(str(out_img))
-                self._log(f"   Bild gespeichert: {out_img.name} ({annotated.shape[1]}×{annotated.shape[0]} px)")
+                self._q.put(("last_output", str(out_img)))
+                self._log(f"   Gespeichert: {out_img.name} ({annotated.shape[1]}x{annotated.shape[0]} px)")
 
-                all_entries.append((geo_image, crack_lines))
+                all_entries.append((geo_image, crack_features))
 
             except Exception as exc:
-                self._log(f"   ❌ Fehler: {exc}")
+                self._log(f"   Fehler: {exc}")
                 traceback.print_exc()
 
-        # ── Export GeoJSON + DXF ─────────────────────────────────────────────
+        # --- GeoJSON Export ---
         ts           = _dt.datetime.now().strftime("%Y%m%d_%H%M%S")
         geojson_path = str(output_dir / f"cracks_{ts}.geojson")
         dxf_path     = str(output_dir / f"cracks_{ts}.dxf")
 
-        self._status("Exportiere GeoJSON …")
+        self._status("Exportiere GeoJSON ...")
         self._progress(0.97)
+        geojson_ok = False
         try:
-            export_geojson(all_entries, geojson_path)
-            self._log(f"   GeoJSON: cracks_{ts}.geojson")
+            if HAS_SHAPELY:
+                export_geojson(all_entries, geojson_path)
+                total_features = sum(len(g) for _, g in all_entries)
+                self._log(f"   GeoJSON: cracks_{ts}.geojson ({total_features} Features)")
+                geojson_ok = True
+            else:
+                self._log("   GeoJSON uebersprungen (shapely fehlt)")
         except Exception as exc:
-            self._log(f"   ⚠ GeoJSON-Fehler: {exc}")
+            self._log(f"   GeoJSON-Fehler: {exc}")
 
-        self._status("Exportiere DXF …")
+        # --- DXF Export ---
+        self._status("Exportiere DXF ...")
         self._progress(0.99)
+        dxf_ok = False
         try:
-            if HAS_EZDXF:
+            if HAS_EZDXF and HAS_SHAPELY:
                 export_dxf(all_entries, dxf_path)
                 self._log(f"   DXF:     cracks_{ts}.dxf")
-            else:
-                self._log("   ⚠ DXF übersprungen (ezdxf fehlt)")
+                dxf_ok = True
+            elif not HAS_EZDXF:
+                self._log("   DXF uebersprungen (ezdxf fehlt - pip install ezdxf)")
         except Exception as exc:
-            self._log(f"   ⚠ DXF-Fehler: {exc}")
+            self._log(f"   DXF-Fehler: {exc}")
 
         total_cracks  = sum(len(g) for _, g in all_entries)
         total_elapsed = time.time() - t_start
         self._log(
-            f"\n{'─'*54}\n"
+            f"\n{'─' * 54}\n"
             f"  {total_cracks} Risse | {total} Bild(er) | {total_elapsed:.1f}s\n"
+            f"  GeoJSON: {'OK' if geojson_ok else 'FEHLER'}  |  DXF: {'OK' if dxf_ok else 'FEHLER'}\n"
             f"  Output: {output_dir}\n"
-            f"{'─'*54}"
+            f"{'─' * 54}"
         )
         self._progress(1.0)
-        self._status(f"✅ Fertig – {total_cracks} Risse erkannt")
+        self._status(f"Fertig - {total_cracks} Risse erkannt")
+        # Exportpfade fuer UI-Buttons bekanntgeben
+        self._q.put(("export_paths", {
+            "geojson": geojson_path if geojson_ok else None,
+            "dxf":     dxf_path     if dxf_ok     else None,
+            "output_dir": str(output_dir),
+        }))
         self._done(True)
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
+# ==============================================================================
 #  DESKTOP APP
-# ═══════════════════════════════════════════════════════════════════════════════
+# ==============================================================================
+
+class ZoomWindow(ctk.CTkToplevel):
+    """Scrollbares Vollbild-Zoom-Fenster fuer das Ergebnis-Bild."""
+
+    def __init__(self, parent, img_np: np.ndarray):
+        super().__init__(parent)
+        self.title("Ergebnis - Zoom")
+        self.geometry("1200x800")
+        self.configure(fg_color=APP_COLORS["bg"])
+
+        # Canvas mit Scrollbars
+        self._canvas = ctk.CTkCanvas(self, bg=APP_COLORS["bg"],
+                                     highlightthickness=0)
+        sb_x = ctk.CTkScrollbar(self, orientation="horizontal",
+                                 command=self._canvas.xview)
+        sb_y = ctk.CTkScrollbar(self, orientation="vertical",
+                                 command=self._canvas.yview)
+        self._canvas.configure(xscrollcommand=sb_x.set,
+                                yscrollcommand=sb_y.set)
+
+        sb_x.pack(side="bottom", fill="x")
+        sb_y.pack(side="right",  fill="y")
+        self._canvas.pack(side="left", fill="both", expand=True)
+
+        pil_img = Image.fromarray(img_np)
+        from PIL import ImageTk
+        self._tk_img  = ImageTk.PhotoImage(pil_img)
+        self._canvas.create_image(0, 0, anchor="nw", image=self._tk_img)
+        self._canvas.configure(scrollregion=self._canvas.bbox("all"))
+
+        # Mouse-Wheel-Scrolling
+        self._canvas.bind("<MouseWheel>",
+                          lambda e: self._canvas.yview_scroll(-1 * (e.delta // 120), "units"))
+        self._canvas.bind("<Shift-MouseWheel>",
+                          lambda e: self._canvas.xview_scroll(-1 * (e.delta // 120), "units"))
+
 
 class CrackDetectApp(ctk.CTk):
 
@@ -1238,33 +1581,40 @@ class CrackDetectApp(ctk.CTk):
         ctk.set_appearance_mode("dark")
         ctk.set_default_color_theme("dark-blue")
 
-        self.title("CrackDetect – Automatische Riss-Erkennung")
-        self.geometry("1050x720")
-        self.minsize(860, 600)
+        self.title("CrackDetect - Automatische Riss-Erkennung")
+        self.geometry("1100x780")
+        self.minsize(900, 640)
         self.configure(fg_color=APP_COLORS["bg"])
 
-        self._input_paths: List[Path] = []
-        self._worker: Optional[Worker]          = None
-        self._thread: Optional[threading.Thread] = None
-        self._msg_q: queue.Queue                = queue.Queue()
-        self._preview_image: Optional[ctk.CTkImage] = None
+        self._input_paths:     List[Path] = []
+        self._worker:          Optional[Worker]           = None
+        self._thread:          Optional[threading.Thread] = None
+        self._msg_q:           queue.Queue                = queue.Queue()
+        self._preview_image:   Optional[ctk.CTkImage]    = None
+        self._last_output_img: Optional[str]              = None
+        self._last_annotated:  Optional[np.ndarray]      = None
+        self._zoom_win:        Optional[ZoomWindow]       = None
+        self._last_export:     dict                       = {}
 
         self._build_ui()
         self._poll()
         self.protocol("WM_DELETE_WINDOW", self._on_close)
 
-    # ── UI ────────────────────────────────────────────────────────────────────
+    # --- UI ---
+
     def _build_ui(self):
         # Header
         hdr = ctk.CTkFrame(self, fg_color=APP_COLORS["accent"], corner_radius=0)
         hdr.pack(fill="x")
         ctk.CTkLabel(
-            hdr, text="🔍  CrackDetect",
+            hdr, text="CrackDetect",
             font=ctk.CTkFont(size=26, weight="bold"),
             text_color=APP_COLORS["highlight"],
         ).pack(side="left", padx=22, pady=14)
+        unet_available = UNET_ONNX_PATH.exists()
+        model_hint = "U-Net" if unet_available else "SAM3"
         ctk.CTkLabel(
-            hdr, text="Automatische Riss-Erkennung · SAM3 · GeoJSON & DXF",
+            hdr, text=f"Automatische Riss-Erkennung  |  {model_hint}  |  GeoJSON & DXF",
             font=ctk.CTkFont(size=12),
             text_color=APP_COLORS["text_dim"],
         ).pack(side="left", padx=0, pady=14)
@@ -1273,8 +1623,8 @@ class CrackDetectApp(ctk.CTk):
         main = ctk.CTkFrame(self, fg_color="transparent")
         main.pack(fill="both", expand=True, padx=18, pady=14)
 
-        # ── Left panel ────────────────────────────────────────────────────────
-        left = ctk.CTkFrame(main, fg_color=APP_COLORS["panel"], corner_radius=12, width=280)
+        # --- Left panel ---
+        left = ctk.CTkFrame(main, fg_color=APP_COLORS["panel"], corner_radius=12, width=290)
         left.pack(side="left", fill="y", padx=(0, 12))
         left.pack_propagate(False)
 
@@ -1293,17 +1643,17 @@ class CrackDetectApp(ctk.CTk):
                 fg_color=APP_COLORS["accent"],
                 hover_color="#1a4a7a",
                 corner_radius=8, height=36, anchor="w",
-                command=cmd, width=248,
+                command=cmd, width=258,
             ).pack(padx=16, pady=(0, 6))
 
         # Input
         section("EINGABE")
-        mkbtn("📂  Bild(er) auswählen", self._browse_files)
-        mkbtn("📁  Ordner auswählen",   self._browse_folder)
+        mkbtn("  Bild(er) auswaehlen", self._browse_files)
+        mkbtn("  Ordner auswaehlen",   self._browse_folder)
         self._lbl_input = ctk.CTkLabel(
             left, text="Keine Auswahl",
             font=ctk.CTkFont(size=11), text_color=APP_COLORS["text_dim"],
-            wraplength=240, justify="left",
+            wraplength=250, justify="left",
         )
         self._lbl_input.pack(anchor="w", padx=16, pady=(0, 6))
 
@@ -1320,19 +1670,19 @@ class CrackDetectApp(ctk.CTk):
             button_color=APP_COLORS["highlight"],
             button_hover_color=APP_COLORS["hover"],
             dropdown_fg_color="#1a1a2e",
-            font=ctk.CTkFont(size=13), width=248,
+            font=ctk.CTkFont(size=13), width=258,
             command=self._on_preset_change,
         ).pack(padx=16, pady=(0, 10))
 
-        ctk.CTkLabel(left, text="Zusätzliche Suchbegriffe",
+        ctk.CTkLabel(left, text="Zusaetzliche Suchbegriffe",
                      font=ctk.CTkFont(size=12)).pack(anchor="w", padx=16, pady=(0, 2))
         self._custom_entry = ctk.CTkEntry(
             left, placeholder_text="z.B. spalling . delamination",
-            font=ctk.CTkFont(size=12), width=248,
+            font=ctk.CTkFont(size=12), width=258,
         )
         self._custom_entry.pack(padx=16, pady=(0, 10))
 
-        ctk.CTkLabel(left, text="Confidence (empfindlicher ↓)",
+        ctk.CTkLabel(left, text="Confidence (empfindlicher unten)",
                      font=ctk.CTkFont(size=12)).pack(anchor="w", padx=16, pady=(0, 2))
         self._conf_var = ctk.DoubleVar(value=SAM3_CONFIDENCE)
         self._conf_label = ctk.CTkLabel(left, text=f"{SAM3_CONFIDENCE:.2f}",
@@ -1341,11 +1691,11 @@ class CrackDetectApp(ctk.CTk):
         self._conf_label.pack(anchor="e", padx=16)
         ctk.CTkSlider(
             left, from_=0.01, to=0.50, variable=self._conf_var,
-            width=248, progress_color=APP_COLORS["highlight"],
+            width=258, progress_color=APP_COLORS["highlight"],
             command=lambda v: self._conf_label.configure(text=f"{v:.2f}"),
         ).pack(padx=16, pady=(0, 10))
 
-        ctk.CTkLabel(left, text="Min. Fläche (px²)",
+        ctk.CTkLabel(left, text="Min. Flaeche (px^2)",
                      font=ctk.CTkFont(size=12)).pack(anchor="w", padx=16, pady=(0, 2))
         self._area_var = ctk.IntVar(value=SAM3_MIN_MASK_PX)
         self._area_label = ctk.CTkLabel(left, text=f"{SAM3_MIN_MASK_PX}",
@@ -1354,11 +1704,70 @@ class CrackDetectApp(ctk.CTk):
         self._area_label.pack(anchor="e", padx=16)
         ctk.CTkSlider(
             left, from_=10, to=2000, variable=self._area_var,
-            width=248, progress_color=APP_COLORS["highlight"],
+            width=258, progress_color=APP_COLORS["highlight"],
             command=lambda v: self._area_label.configure(text=f"{int(v)}"),
-        ).pack(padx=16, pady=(0, 14))
+        ).pack(padx=16, pady=(0, 10))
 
-        # ── Right panel ───────────────────────────────────────────────────────
+        # Tile-Groesse
+        ctk.CTkLabel(left, text="Kachelgroesse",
+                     font=ctk.CTkFont(size=12)).pack(anchor="w", padx=16, pady=(0, 2))
+        self._tile_var = ctk.StringVar(value="768")
+        ctk.CTkSegmentedButton(
+            left, values=["512", "768", "1024"],
+            variable=self._tile_var,
+            font=ctk.CTkFont(size=12), width=258,
+            selected_color=APP_COLORS["highlight"],
+            selected_hover_color=APP_COLORS["hover"],
+        ).pack(padx=16, pady=(0, 10))
+
+        # Multi-Scale
+        self._multiscale_var = ctk.BooleanVar(value=True)
+        ctk.CTkCheckBox(
+            left,
+            text="Feine Risse (Multi-Scale)",
+            variable=self._multiscale_var,
+            font=ctk.CTkFont(size=12),
+            checkbox_width=18, checkbox_height=18,
+            checkmark_color=APP_COLORS["highlight"],
+            border_color=APP_COLORS["accent"],
+        ).pack(anchor="w", padx=16, pady=(0, 10))
+
+        # Model-Auswahl
+        section("MODELL")
+        unet_ok = UNET_ONNX_PATH.exists()
+        model_values = ["SAM3 (Zero-Shot)"]
+        if unet_ok:
+            model_values.append("U-Net (trainiert)")
+        self._model_var = ctk.StringVar(
+            value="U-Net (trainiert)" if unet_ok else "SAM3 (Zero-Shot)"
+        )
+        ctk.CTkOptionMenu(
+            left, values=model_values,
+            variable=self._model_var,
+            fg_color=APP_COLORS["accent"],
+            button_color=APP_COLORS["highlight"],
+            button_hover_color=APP_COLORS["hover"],
+            dropdown_fg_color="#1a1a2e",
+            font=ctk.CTkFont(size=13), width=258,
+        ).pack(padx=16, pady=(0, 4))
+
+        if not unet_ok:
+            ctk.CTkLabel(
+                left,
+                text="Kein trainiertes Modell gefunden.\nLege crack_unet.onnx in den model/ Ordner.",
+                font=ctk.CTkFont(size=10),
+                text_color=APP_COLORS["warning"],
+                wraplength=240, justify="left",
+            ).pack(anchor="w", padx=16, pady=(0, 10))
+        else:
+            ctk.CTkLabel(
+                left,
+                text=f"Modell: {UNET_ONNX_PATH.name}",
+                font=ctk.CTkFont(size=10),
+                text_color=APP_COLORS["success"],
+            ).pack(anchor="w", padx=16, pady=(0, 10))
+
+        # --- Right panel ---
         right = ctk.CTkFrame(main, fg_color=APP_COLORS["panel"], corner_radius=12)
         right.pack(side="left", fill="both", expand=True)
 
@@ -1369,11 +1778,18 @@ class CrackDetectApp(ctk.CTk):
 
         # Preview image
         self._preview_label = ctk.CTkLabel(
-            right, text="Kein Bild", fg_color="#0d0d1a",
+            right, text="Kein Bild",
+            fg_color="#0d0d1a",
             font=ctk.CTkFont(size=13), text_color=APP_COLORS["text_dim"],
             corner_radius=8,
         )
         self._preview_label.pack(fill="both", expand=True, padx=12, pady=(0, 6))
+        self._preview_label.bind("<Button-1>", self._open_zoom_window)
+
+        hint = ctk.CTkLabel(right, text="Klick auf Bild oeffnet Zoom-Ansicht",
+                            font=ctk.CTkFont(size=10),
+                            text_color=APP_COLORS["text_dim"])
+        hint.pack(anchor="e", padx=14, pady=(0, 4))
 
         # Log
         ctk.CTkLabel(right, text="PROTOKOLL",
@@ -1407,7 +1823,7 @@ class CrackDetectApp(ctk.CTk):
         bar.pack(fill="x", side="bottom")
 
         self._btn_start = ctk.CTkButton(
-            bar, text="▶  Risse erkennen",
+            bar, text="  Risse erkennen",
             font=ctk.CTkFont(size=14, weight="bold"),
             fg_color=APP_COLORS["highlight"], hover_color=APP_COLORS["hover"],
             corner_radius=8, height=42, command=self._start,
@@ -1415,28 +1831,49 @@ class CrackDetectApp(ctk.CTk):
         self._btn_start.pack(side="left", padx=16, pady=10)
 
         self._btn_stop = ctk.CTkButton(
-            bar, text="⏹  Abbrechen",
+            bar, text="  Abbrechen",
             font=ctk.CTkFont(size=14, weight="bold"),
             fg_color="#374151", hover_color="#4b5563",
             corner_radius=8, height=42, command=self._stop, state="disabled",
         )
-        self._btn_stop.pack(side="left", padx=(0, 16), pady=10)
+        self._btn_stop.pack(side="left", padx=(0, 8), pady=10)
+
+        # Export-Buttons (werden nach der Analyse aktiv)
+        self._btn_geojson = ctk.CTkButton(
+            bar, text="  GeoJSON",
+            font=ctk.CTkFont(size=13),
+            fg_color="#1a4a3a", hover_color="#256b52",
+            corner_radius=8, height=42, width=118,
+            command=self._open_geojson, state="disabled",
+        )
+        self._btn_geojson.pack(side="left", padx=(0, 6), pady=10)
+
+        self._btn_dxf = ctk.CTkButton(
+            bar, text="  DXF",
+            font=ctk.CTkFont(size=13),
+            fg_color="#1a3a4a", hover_color="#255a6b",
+            corner_radius=8, height=42, width=100,
+            command=self._open_dxf,
+            state="disabled" if HAS_EZDXF else "disabled",
+        )
+        self._btn_dxf.pack(side="left", padx=(0, 8), pady=10)
 
         ctk.CTkButton(
-            bar, text="📁  Output öffnen",
+            bar, text="  Output",
             font=ctk.CTkFont(size=13),
             fg_color="#374151", hover_color="#4b5563",
-            corner_radius=8, height=42, width=150,
+            corner_radius=8, height=42, width=110,
             command=self._open_output,
         ).pack(side="right", padx=16, pady=10)
 
-    # ── Helpers ───────────────────────────────────────────────────────────────
+    # --- Helpers ---
+
     def _on_preset_change(self, _value):
-        pass  # could enable/disable custom entry
+        pass
 
     def _browse_files(self):
         paths = filedialog.askopenfilenames(
-            title="Bilder auswählen",
+            title="Bilder auswaehlen",
             filetypes=[("Bilder", "*.jpg *.jpeg *.png *.tif *.tiff *.bmp *.webp"), ("Alle", "*.*")],
         )
         if paths:
@@ -1446,7 +1883,7 @@ class CrackDetectApp(ctk.CTk):
             self._lbl_input.configure(text=label)
 
     def _browse_folder(self):
-        folder = filedialog.askdirectory(title="Ordner mit Bildern auswählen")
+        folder = filedialog.askdirectory(title="Ordner mit Bildern auswaehlen")
         if folder:
             f = Path(folder)
             found: List[Path] = []
@@ -1458,10 +1895,44 @@ class CrackDetectApp(ctk.CTk):
             self._lbl_input.configure(text=f"{n} Bild(er) in {f.name}/")
 
     def _open_output(self):
-        if self._input_paths:
+        out_dir = self._last_export.get("output_dir")
+        if out_dir and Path(out_dir).exists():
+            os.startfile(str(out_dir))
+        elif self._input_paths:
             out = self._input_paths[0].parent / "output"
             out.mkdir(exist_ok=True)
             os.startfile(str(out))
+
+    def _open_geojson(self):
+        path = self._last_export.get("geojson")
+        if path and Path(path).exists():
+            os.startfile(str(path))
+        else:
+            self._append_log("GeoJSON nicht gefunden - Analyse zuerst ausfuehren.")
+
+    def _open_dxf(self):
+        path = self._last_export.get("dxf")
+        if path and Path(path).exists():
+            os.startfile(str(path))
+        else:
+            self._append_log("DXF nicht gefunden - Analyse zuerst ausfuehren.")
+
+    def _open_zoom_window(self, _event=None):
+        """Klick auf Vorschau oeffnet scrollbares Zoom-Fenster mit vollem Bild."""
+        if self._last_annotated is None:
+            if self._last_output_img and Path(self._last_output_img).exists():
+                # Fallback: gespeichertes Bild laden
+                img = np.array(Image.open(self._last_output_img).convert("RGB"))
+                self._last_annotated = img
+            else:
+                return
+
+        if self._zoom_win is not None and self._zoom_win.winfo_exists():
+            self._zoom_win.focus()
+            return
+
+        self._zoom_win = ZoomWindow(self, self._last_annotated)
+        self._zoom_win.focus()
 
     def _append_log(self, text: str):
         self._log_box.configure(state="normal")
@@ -1470,17 +1941,19 @@ class CrackDetectApp(ctk.CTk):
         self._log_box.configure(state="disabled")
 
     def _update_preview(self, img_np: np.ndarray):
+        self._last_annotated = img_np
         h, w = img_np.shape[:2]
-        # Fit into preview label (max 600 wide, 400 tall)
-        max_w, max_h = 600, 400
+        max_w, max_h = 680, 420
         scale = min(max_w / w, max_h / h, 1.0)
-        nw, nh = max(1, int(w * scale)), max(1, int(h * scale))
+        nw = max(1, int(w * scale))
+        nh = max(1, int(h * scale))
         resized = cv2.resize(img_np, (nw, nh), interpolation=cv2.INTER_AREA)
         pil_img = Image.fromarray(resized)
         self._preview_image = ctk.CTkImage(light_image=pil_img, dark_image=pil_img, size=(nw, nh))
         self._preview_label.configure(image=self._preview_image, text="")
 
-    # ── Queue polling ─────────────────────────────────────────────────────────
+    # --- Queue polling ---
+
     def _poll(self):
         try:
             while True:
@@ -1493,6 +1966,26 @@ class CrackDetectApp(ctk.CTk):
                     self._progress_bar.set(float(data))
                 elif kind == "preview":
                     self._update_preview(data)
+                elif kind == "last_output":
+                    self._last_output_img = data
+                elif kind == "export_paths":
+                    self._last_export = data
+                    # GeoJSON-Button aktivieren
+                    if data.get("geojson"):
+                        self._btn_geojson.configure(
+                            state="normal",
+                            text=f"  GeoJSON",
+                            fg_color="#22c55e", hover_color="#16a34a",
+                            text_color="#000000",
+                        )
+                    # DXF-Button aktivieren
+                    if data.get("dxf") and HAS_EZDXF:
+                        self._btn_dxf.configure(
+                            state="normal",
+                            text=f"  DXF",
+                            fg_color="#3b82f6", hover_color="#2563eb",
+                            text_color="#ffffff",
+                        )
                 elif kind == "done":
                     self._btn_start.configure(state="normal")
                     self._btn_stop.configure(state="disabled")
@@ -1500,20 +1993,35 @@ class CrackDetectApp(ctk.CTk):
             pass
         self.after(80, self._poll)
 
-    # ── Start / Stop ──────────────────────────────────────────────────────────
+    # --- Start / Stop ---
+
     def _start(self):
         if not self._input_paths:
-            self._append_log("❌ Bitte zuerst Bilder oder Ordner auswählen.")
+            self._append_log("Bitte zuerst Bilder oder Ordner auswaehlen.")
             return
         if self._thread and self._thread.is_alive():
             return
 
         self._btn_start.configure(state="disabled")
         self._btn_stop.configure(state="normal")
-        self._lbl_status.configure(text="⏳ Starte Analyse …")
+        self._lbl_status.configure(text="Starte Analyse ...")
         self._progress_bar.set(0)
         self._append_log("=" * 54)
-        self._append_log(f"Starte: {len(self._input_paths)} Bild(er)")
+        multi = self._multiscale_var.get()
+        tile  = int(self._tile_var.get())
+        use_unet = "U-Net" in self._model_var.get()
+        self._append_log(
+            f"Starte: {len(self._input_paths)} Bild(er) | "
+            f"Kachel: {tile}px | Multi-Scale: {'ja' if multi else 'nein'} | "
+            f"Modell: {'U-Net' if use_unet else 'SAM3'}"
+        )
+
+        # Export-Buttons zuruecksetzen
+        self._btn_geojson.configure(state="disabled", fg_color="#1a4a3a",
+                                    text="  GeoJSON", text_color="white")
+        self._btn_dxf.configure(state="disabled", fg_color="#1a3a4a",
+                                text="  DXF", text_color="white")
+        self._last_export = {}
 
         self._worker = Worker(self._msg_q)
         self._thread = threading.Thread(
@@ -1524,6 +2032,9 @@ class CrackDetectApp(ctk.CTk):
                 self._custom_entry.get(),
                 self._conf_var.get(),
                 int(self._area_var.get()),
+                tile,
+                multi,
+                use_unet,
             ),
             daemon=True,
         )
@@ -1539,26 +2050,36 @@ class CrackDetectApp(ctk.CTk):
         self.destroy()
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
+# ==============================================================================
 #  EINSTIEGSPUNKT
-# ═══════════════════════════════════════════════════════════════════════════════
+# ==============================================================================
 
 if __name__ == "__main__":
     print()
     print(" ================================================================")
-    print("   CrackDetect – Automatische Riss-Erkennung")
-    print("   Powered by SAM3")
+    print("   CrackDetect - Automatische Riss-Erkennung")
+    print("   Powered by SAM3 + U-Net")
     print(" ================================================================")
     print()
-    print("[INFO] Lade KI-Modelle …")
+
+    # Versuche U-Net zu laden (optional, kein Fehler wenn nicht vorhanden)
+    unet_loaded = load_unet()
+
+    # SAM3 laden (Pflicht fuer SAM3-Modus)
+    print("[INFO] Lade SAM3 ...")
+    sam3_loaded = False
     try:
         load_models()
+        sam3_loaded = True
     except Exception as e:
-        print(f"  [FEHLER] {e}")
-        print("  Bitte start.bat erneut ausführen.")
-        input("  Enter drücken zum Beenden …")
-        sys.exit(1)
+        print(f"  [WARN] SAM3 nicht geladen: {e}")
+        if not unet_loaded:
+            print("  Weder SAM3 noch U-Net verfuegbar.")
+            print("  Bitte start.bat ausfuehren und/oder Training abschliessen.")
+            input("  Enter druecken zum Beenden ...")
+            sys.exit(1)
+        print("  SAM3 nicht verfuegbar - nur U-Net Modus moeglich.")
 
-    print("[INFO] Starte Desktop-App …")
+    print("[INFO] Starte Desktop-App ...")
     app = CrackDetectApp()
     app.mainloop()

@@ -37,7 +37,7 @@ if exist ".setup_complete" (
         goto :EOF
     )
     call venv\Scripts\activate.bat
-    python -c "import gradio, torch" >nul 2>&1
+    python -c "import customtkinter, torch" >nul 2>&1
     if errorlevel 1 (
         echo  [WARNING] Packages missing in venv - repeating setup.
         del /f ".setup_complete" >nul 2>&1
@@ -255,8 +255,7 @@ echo  ================================================================
 echo    All checks passed! Launching CrackDetect ...
 echo  ================================================================
 echo.
-echo  [INFO] The app will open in your browser at:
-echo         http://127.0.0.1:7861
+echo  [INFO] Das Desktop-Fenster oeffnet sich gleich.
 echo.
 echo  [INFO] Do NOT close this window while the app is running.
 echo         To stop: press Ctrl+C
