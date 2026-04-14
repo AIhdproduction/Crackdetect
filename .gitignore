@@ -23,6 +23,7 @@ output/
 # Test data
 test/
 beispiel/
+Own_data/
 
 # Setup marker
 .setup_complete
