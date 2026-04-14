@@ -1,24 +1,19 @@
 """
 CrackDetect - Automatische Riss-Erkennung in Bildern und Orthofotos
 ====================================================================
-Powered by SAM3 (Text-Prompt -> Pixel-Masken)
+Powered by U-Net (trainiertes Modell -> Pixel-Masken)
 
 Pipeline:
   1. Bild laden (JPG/PNG/TIFF - mit rasterio falls GeoTIFF)
   2. Automatisches Tiling fuer grosse Bilder (> MAX_DIRECT_SIZE px)
-     Optional: Multi-Scale (zweiter Durchlauf mit halber Kachelgroesse)
-  3. SAM3 erkennt Risse via Text-Prompt (direkte Segmentierung)
+  3. U-Net erkennt Risse (direkte Pixel-Segmentierung)
   4. Morphologisches Closing verbindet unterbrochene Risse
-  5. Aspect-Ratio-Filter entfernt runde Flecken (keine Risse)
-  6. Masken werden zu Shapely-Polygonen vektorisiert
-  7. NMS entfernt Duplikate aus ueberlappenden Kacheln
-  8. Skelettierung: gefuellte Maske -> 1-px-Mittellinie
-  9. Distance Transform: Rissbreite (avg + max) pro Risspixel
- 10. Pixel-Koordinaten -> Weltkoordinaten (falls GeoTIFF mit CRS)
- 11. Export als GeoJSON (mit Attributen: Laenge, Breite, Confidence, Datum)
-     Optional: DXF-Export
-
-Fuer Details: siehe projekt.md
+  5. Masken werden zu Shapely-Polygonen vektorisiert
+  6. NMS entfernt Duplikate aus ueberlappenden Kacheln
+  7. Kontur-Extraktion: Umrandung jeder Riss-Region
+  8. Distance Transform: Rissbreite (avg + max) pro Risspixel
+  9. Pixel-Koordinaten -> Weltkoordinaten (falls GeoTIFF mit CRS)
+ 10. Export als GeoJSON und DXF
 """
 
 import os
@@ -77,38 +72,22 @@ try:
 except ImportError:
     HAS_SKIMAGE = False
 
-# --- SAM3 Imports ---
-HAS_SAM3 = False
-try:
-    from sam3 import build_sam3_image_model
-    from sam3.model.sam3_image_processor import Sam3Processor
-    HAS_SAM3 = True
-except ImportError:
-    print("[ERROR] SAM3 nicht installiert! Bitte start.bat erneut ausfuehren.")
+
 
 
 # ==============================================================================
 #  KONFIGURATION
 # ==============================================================================
 
-BASE_DIR        = Path(__file__).parent
-CHECKPOINTS_DIR = BASE_DIR / "checkpoints"
-SAM3_CKPT_DIR   = CHECKPOINTS_DIR / "sam3"
+BASE_DIR = Path(__file__).parent
 
 TILE_SIZE        = 768    # Standard-Kachelgroesse (512/768/1024 via UI)
 TILE_OVERLAP_PCT = 0.15   # 15% Ueberlappung
 MAX_DIRECT_SIZE  = 2500   # Ueber diesem Wert wird automatisch getiled
 
-SAM3_CONFIDENCE         = 0.08   # Niedrigerer Default fuer feinere Risse
-SAM3_MIN_MASK_PX        = 80     # Mindestgroesse einer Maske in Pixeln
-SAM3_MAX_MASKS_PER_TILE = 40     # Maximale Masken pro Kachel (Top-N nach Score)
-SAM3_MAX_POLY_AREA      = 500_000  # Maximale Polygon-Flaeche px^2
+MAX_POLY_AREA    = 500_000  # Maximale Polygon-Flaeche px^2
 
-# Aspect-Ratio Filter: Masken deren BBox-Verhaeltnis kleiner als dieser Wert
-# sind wahrscheinlich runde Flecken und keine Risse.
-ASPECT_RATIO_MIN = 1.8
-
-# Morphologisches Closing nach SAM3 (verbindet unterbrochene Risse)
+# Morphologisches Closing (verbindet unterbrochene Risse)
 CLOSING_KERNEL_SIZE = 5
 
 SUPPORTED_EXT = {".jpg", ".jpeg", ".png", ".tif", ".tiff", ".bmp", ".webp"}
@@ -125,73 +104,24 @@ WORLD_FILE_EXT = {
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
-_sam3_proc   = None
 _unet_session = None   # onnxruntime InferenceSession fuer das trainierte U-Net
 
 # Pfad zum trainierten U-Net ONNX (liegt im model/ Ordner neben crackdetect.py)
 UNET_ONNX_PATH = BASE_DIR / "model" / "crack_unet.onnx"
-# Fallback: PyTorch checkpoint
-UNET_CKPT_PATH = BASE_DIR / "model" / "best_model.pth"
 
 
 # ==============================================================================
-#  MODELLE LADEN
+#  MODELL LADEN
 # ==============================================================================
 
 def load_models() -> None:
-    """Laedt SAM3 einmalig. Wird beim App-Start aufgerufen."""
-    global _sam3_proc
-
-    if not HAS_SAM3:
-        raise RuntimeError("SAM3 nicht installiert - start.bat erneut ausfuehren.")
-
+    """Laedt das U-Net ONNX Modell. Wird beim App-Start aufgerufen."""
     print(f"[INFO] Verwende Device: {DEVICE.upper()}")
-
-    # Monkey-patch: fused addmm_act -> standard float32
-    try:
-        import sam3.perflib.fused as _fused_mod
-        import sam3.model.vitdet as _vitdet_mod
-
-        def _addmm_act_f32(activation, linear, mat1):
-            x = torch.nn.functional.linear(mat1, linear.weight, linear.bias)
-            return activation()(x)
-
-        _fused_mod.addmm_act = _addmm_act_f32
-        _vitdet_mod.addmm_act = _addmm_act_f32
-    except Exception as e:
-        print(f"[WARN] Monkey-patch fuer addmm_act fehlgeschlagen: {e}")
-
-    import sam3 as _sam3_pkg
-    bpe_path = Path(_sam3_pkg.__file__).parent / "assets" / "bpe_simple_vocab_16e6.txt.gz"
-    if not bpe_path.exists():
-        bpe_path = Path(_sam3_pkg.__file__).parent.parent / "assets" / "bpe_simple_vocab_16e6.txt.gz"
-
-    ckpt_path = None
-    if SAM3_CKPT_DIR.exists():
-        for candidate in ("sam3.pt", "model.safetensors"):
-            if (SAM3_CKPT_DIR / candidate).exists():
-                ckpt_path = str(SAM3_CKPT_DIR / candidate)
-                break
-
-    if ckpt_path is None:
-        print("[INFO] Checkpoint nicht lokal - lade von HuggingFace ...")
-
-    print("[INFO] Lade SAM3 ...")
-    model = build_sam3_image_model(
-        checkpoint_path=ckpt_path,
-        bpe_path=str(bpe_path) if bpe_path.exists() else None,
-        device=DEVICE,
-        load_from_HF=(ckpt_path is None),
-    )
-    model = model.float()
-
-    _sam3_proc = Sam3Processor(
-        model,
-        confidence_threshold=SAM3_CONFIDENCE,
-        device=DEVICE,
-    )
-
-    print(f"[OK]   SAM3 bereit ({DEVICE.upper()}).")
+    ok = load_unet()
+    if not ok:
+        raise RuntimeError(
+            "Kein Modell gefunden. Lege crack_unet.onnx in den model/ Ordner."
+        )
 
 
 def load_unet() -> bool:
@@ -441,25 +371,7 @@ def _apply_closing(mask: np.ndarray, kernel_size: int = CLOSING_KERNEL_SIZE) -> 
     return cv2.morphologyEx(mask.astype(np.uint8), cv2.MORPH_CLOSE, kernel).astype(bool)
 
 
-def _passes_aspect_ratio(mask: np.ndarray, min_ratio: float = ASPECT_RATIO_MIN) -> bool:
-    """
-    Prueft ob eine Maske eine Riss-typische Laengsform hat.
-    Masken deren Bounding-Box-Verhaeltnis unter min_ratio liegt (= runde Flecken)
-    werden verworfen.
-    """
-    ys, xs = np.where(mask)
-    if len(xs) == 0:
-        return False
-    bw = int(xs.max() - xs.min()) + 1
-    bh = int(ys.max() - ys.min()) + 1
-    if bw == 0 or bh == 0:
-        return False
-    ratio = max(bw, bh) / max(min(bw, bh), 1)
-    return ratio >= min_ratio
 
-
-# ==============================================================================
-#  U-NET ONNX INFERENZ
 # ==============================================================================
 
 _IMAGENET_MEAN = np.array([0.485, 0.456, 0.406], dtype=np.float32)
@@ -883,15 +795,9 @@ class CrackFeature:
 #  HAUPT-PIPELINE
 # ==============================================================================
 
-def _parse_prompts(text_prompt: str) -> List[str]:
-    parts = [p.strip() for p in text_prompt.split(".")]
-    return [p for p in parts if p]
-
-
 def _run_scale(
     img: np.ndarray,
     tile_size: int,
-    text_prompts: List[str],
     confidence: float,
     min_area: int,
     log_fn=None,
@@ -899,17 +805,10 @@ def _run_scale(
     scale_label: str = "",
     pct_start: float = 0.0,
     pct_end: float = 0.8,
-    use_unet: bool = False,
 ) -> Tuple[List, List[float]]:
-    """
-    Fuhrt einen vollstaendigen Tiling-Durchlauf auf `img` durch.
-    Gibt (polygons, scores) zurueck.
-    use_unet=True -> U-Net ONNX statt SAM3
-    """
+    """Fuhrt einen vollstaendigen Tiling-Durchlauf via U-Net durch."""
     h, w = img.shape[:2]
-
     needs_tiling = max(w, h) > MAX_DIRECT_SIZE
-
     all_polygons: List = []
     all_scores: List[float] = []
 
@@ -918,25 +817,19 @@ def _run_scale(
         prefix = f"[{scale_label}] " if scale_label else ""
         if log_fn:
             log_fn(f"   {prefix}Tiling: {len(tiles)} Kacheln fuer {w}x{h} px")
-
         raw_total = 0
         for i, (x0, y0, x1, y1) in enumerate(tiles):
             pct = pct_start + (pct_end - pct_start) * i / len(tiles)
             if progress_cb:
                 progress_cb(pct, f"{prefix}Kachel {i+1}/{len(tiles)}")
-
             tile = img[y0:y1, x0:x1]
-            if use_unet:
-                masks, scores = detect_unet_tile(tile, threshold=confidence, log_fn=log_fn)
-            else:
-                masks, scores = detect_in_tile(tile, text_prompts, confidence, log_fn=log_fn)
+            masks, scores = detect_unet_tile(tile, threshold=confidence, log_fn=log_fn)
             raw_total += len(masks)
             for mask, score in zip(masks, scores):
                 poly = mask_to_polygon(mask, offset_x=x0, offset_y=y0, min_area=min_area)
                 if poly is not None:
                     all_polygons.append(poly)
                     all_scores.append(score)
-
         if log_fn:
             if raw_total == 0:
                 log_fn(f"   {prefix}0 Masken - Confidence ({confidence:.2f}) weiter senken")
@@ -947,10 +840,7 @@ def _run_scale(
             log_fn(f"   [{scale_label}] Direkt: {w}x{h} px")
         if progress_cb:
             progress_cb(pct_start + (pct_end - pct_start) * 0.2, "Erkenne Risse ...")
-        if use_unet:
-            masks, scores = detect_unet_tile(img, threshold=confidence, log_fn=log_fn)
-        else:
-            masks, scores = detect_in_tile(img, text_prompts, confidence, log_fn=log_fn)
+        masks, scores = detect_unet_tile(img, threshold=confidence, log_fn=log_fn)
         if log_fn and len(masks) == 0:
             log_fn(f"   0 Masken erkannt - Confidence ({confidence:.2f}) weiter senken")
         for mask, score in zip(masks, scores):
@@ -958,23 +848,20 @@ def _run_scale(
             if poly is not None:
                 all_polygons.append(poly)
                 all_scores.append(score)
-
     return all_polygons, all_scores
 
 
 def process_geo_image(
     geo_image: GeoImage,
-    text_prompt: str     = "crack",
-    confidence: float    = SAM3_CONFIDENCE,
+    confidence: float    = 0.50,
     min_area: int        = 100,
     tile_size: int       = TILE_SIZE,
     multi_scale: bool    = True,
-    use_unet: bool       = False,
     progress_cb=None,
     log_fn=None,
 ) -> Tuple[np.ndarray, List[CrackFeature]]:
     """
-    Verarbeitet ein GeoImage komplett.
+    Verarbeitet ein GeoImage komplett via U-Net.
 
     Returns:
         annotated_np   - Bild mit farbigem Overlay (H x W x 3 uint8)
@@ -984,22 +871,15 @@ def process_geo_image(
     h, w = img.shape[:2]
     pixel_size_m = geo_image.pixel_size_m()
 
-    text_prompts = _parse_prompts(text_prompt)
-    if not text_prompts:
-        text_prompts = ["crack"]
-
     # --- Scale 1: Normales Tiling ---
     pct_s1_end = 0.55 if multi_scale else 0.80
-    if use_unet and log_fn:
+    if log_fn:
         log_fn("   [U-Net] Trainiertes Modell aktiv (ONNX)")
-    elif log_fn:
-        log_fn("   [SAM3] Foundation Model aktiv")
 
     polys1, scores1 = _run_scale(
-        img, tile_size, text_prompts, confidence, min_area,
+        img, tile_size, confidence, min_area,
         log_fn=log_fn, progress_cb=progress_cb,
         scale_label="Scale 1", pct_start=0.05, pct_end=pct_s1_end,
-        use_unet=use_unet,
     )
 
     # --- Scale 2: Halbe Kachelgroesse fuer feine Risse ---
@@ -1010,10 +890,9 @@ def process_geo_image(
         if log_fn:
             log_fn(f"   [Scale 2] Feiner Durchlauf mit Kachelgroesse {small_tile} px ...")
         polys2, scores2 = _run_scale(
-            img, small_tile, text_prompts, confidence, min_area,
+            img, small_tile, confidence, min_area,
             log_fn=log_fn, progress_cb=progress_cb,
             scale_label="Scale 2", pct_start=pct_s1_end, pct_end=0.80,
-            use_unet=use_unet,
         )
 
     all_polygons = polys1 + polys2
@@ -1048,7 +927,7 @@ def process_geo_image(
     _report_every = max(1, n_polys // 10)
 
     for skel_i, (poly, score) in enumerate(zip(all_polygons, all_scores)):
-        if hasattr(poly, 'area') and poly.area > SAM3_MAX_POLY_AREA:
+        if hasattr(poly, 'area') and poly.area > MAX_POLY_AREA:
             if log_fn:
                 log_fn(f"   [Skip] Polygon {skel_i+1} zu gross ({int(poly.area):,} px^2) - uebersprungen")
             continue
@@ -1732,40 +1611,18 @@ class CrackDetectApp(ctk.CTk):
             border_color=APP_COLORS["accent"],
         ).pack(anchor="w", padx=16, pady=(0, 10))
 
-        # Model-Auswahl
+        # Modell-Status
         section("MODELL")
         unet_ok = UNET_ONNX_PATH.exists()
-        model_values = ["SAM3 (Zero-Shot)"]
-        if unet_ok:
-            model_values.append("U-Net (trainiert)")
-        self._model_var = ctk.StringVar(
-            value="U-Net (trainiert)" if unet_ok else "SAM3 (Zero-Shot)"
-        )
-        ctk.CTkOptionMenu(
-            left, values=model_values,
-            variable=self._model_var,
-            fg_color=APP_COLORS["accent"],
-            button_color=APP_COLORS["highlight"],
-            button_hover_color=APP_COLORS["hover"],
-            dropdown_fg_color="#1a1a2e",
-            font=ctk.CTkFont(size=13), width=258,
-        ).pack(padx=16, pady=(0, 4))
-
-        if not unet_ok:
-            ctk.CTkLabel(
-                left,
-                text="Kein trainiertes Modell gefunden.\nLege crack_unet.onnx in den model/ Ordner.",
-                font=ctk.CTkFont(size=10),
-                text_color=APP_COLORS["warning"],
-                wraplength=240, justify="left",
-            ).pack(anchor="w", padx=16, pady=(0, 10))
-        else:
-            ctk.CTkLabel(
-                left,
-                text=f"Modell: {UNET_ONNX_PATH.name}",
-                font=ctk.CTkFont(size=10),
-                text_color=APP_COLORS["success"],
-            ).pack(anchor="w", padx=16, pady=(0, 10))
+        model_color = APP_COLORS["success"] if unet_ok else APP_COLORS["warning"]
+        model_text  = f"U-Net geladen: {UNET_ONNX_PATH.name}" if unet_ok else "Kein Modell gefunden.\nLege crack_unet.onnx in den model/ Ordner."
+        ctk.CTkLabel(
+            left,
+            text=model_text,
+            font=ctk.CTkFont(size=11),
+            text_color=model_color,
+            wraplength=240, justify="left",
+        ).pack(anchor="w", padx=16, pady=(0, 10))
 
         # --- Right panel ---
         right = ctk.CTkFrame(main, fg_color=APP_COLORS["panel"], corner_radius=12)

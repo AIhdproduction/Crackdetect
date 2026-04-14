@@ -16,7 +16,7 @@ mode con cols=80 lines=50
 echo.
 echo  ================================================================
 echo    CrackDetect - Automatische Riss-Erkennung
-echo    Powered by SAM3
+echo    Powered by U-Net
 echo  ================================================================
 echo.
 
@@ -37,7 +37,7 @@ if exist ".setup_complete" (
         goto :EOF
     )
     call venv\Scripts\activate.bat
-    python -c "import customtkinter, torch" >nul 2>&1
+    python -c "import customtkinter, torch, onnxruntime" >nul 2>&1
     if errorlevel 1 (
         echo  [WARNING] Packages missing in venv - repeating setup.
         del /f ".setup_complete" >nul 2>&1
@@ -55,12 +55,10 @@ echo  ================================================================
 echo.
 echo  === FIRST-TIME SETUP - this only runs once ===
 echo.
-echo    Step 1/6    Check Python
-echo    Step 2/6    Create virtual environment
-echo    Step 3/6    Install PyTorch with CUDA
-echo    Step 4/6    Install base dependencies
-echo    Step 5/6    Install SAM3 from GitHub
-echo    Step 6/6    Download SAM3 checkpoint
+echo    Step 1/4    Check Python
+echo    Step 2/4    Create virtual environment
+echo    Step 3/4    Install PyTorch with CUDA
+echo    Step 4/4    Install base dependencies
 echo.
 echo  ----------------------------------------------------------------
 echo   Setup starting in 5 seconds ...
@@ -72,7 +70,7 @@ echo.
 
 :: ─── Step 1: Check Python ─────────────────────────────────────────
 echo.
-echo  [Step 1/6] Checking Python installation ...
+echo  [Step 1/4] Checking Python installation ...
 echo  ----------------------------------------------------------------
 python --version 2>nul
 if errorlevel 1 (
@@ -90,7 +88,7 @@ echo  [OK] Python !PYVER! found.
 
 :: ─── Step 2: Virtual environment ──────────────────────────────────
 echo.
-echo  [Step 2/6] Setting up virtual environment ...
+echo  [Step 2/4] Setting up virtual environment ...
 echo  ----------------------------------------------------------------
 if exist "venv\Scripts\activate.bat" (
     echo  [OK] Virtual environment already exists.
@@ -116,7 +114,7 @@ echo  [OK] pip upgraded.
 :: ─── Step 3: Install PyTorch with CUDA ────────────────────────────
 :STEP3
 echo.
-echo  [Step 3/6] Installing PyTorch 2.10 with CUDA 12.8 ...
+echo  [Step 3/4] Installing PyTorch 2.10 with CUDA 12.8 ...
 echo  ----------------------------------------------------------------
 echo  [INFO] Download size: approximately 3 GB
 echo         This can take 5-20 minutes. DO NOT close this window!
@@ -139,7 +137,7 @@ if errorlevel 1 (
 
 :: ─── Step 4: Install base dependencies ────────────────────────────
 echo.
-echo  [Step 4/6] Installing base dependencies ...
+echo  [Step 4/4] Installing base dependencies ...
 echo  ----------------------------------------------------------------
 cmd /c "pip install -r requirements.txt --progress-bar on"
 if errorlevel 1 (
@@ -148,99 +146,6 @@ if errorlevel 1 (
     goto :EOF
 )
 echo  [OK] Base dependencies installed.
-
-:: ─── Step 5: Install SAM3 ─────────────────────────────────────────
-echo.
-echo  [Step 5/6] Installing SAM3 from GitHub ...
-echo  ----------------------------------------------------------------
-echo  [INFO] Requires Git: https://git-scm.com/downloads
-echo         This may take 2-5 minutes.
-echo.
-cmd /c "pip install git+https://github.com/facebookresearch/sam3.git"
-if errorlevel 1 (
-    echo  [ERROR] SAM3 installation failed.
-    echo          Make sure Git is installed: https://git-scm.com/downloads
-    echo  Type "exit" to close this window.
-    goto :EOF
-)
-echo  [OK] SAM3 installed.
-echo.
-echo  [INFO] Installing SAM3 extras ...
-cmd /c "pip install einops pycocotools triton-windows psutil"
-echo  [OK] SAM3 dependencies ready.
-echo.
-echo  [INFO] Fixing numpy version (SAM3 pins old version) ...
-cmd /c "pip install --upgrade numpy"
-echo  [OK] numpy updated.
-
-:: ─── Step 6: HuggingFace Login and SAM3 Checkpoint ────────────────
-if exist "checkpoints\sam3\model.safetensors" goto :SAM3_OK
-if exist "checkpoints\sam3\config.json" goto :SAM3_OK
-
-echo.
-echo  [Step 6/6] Downloading SAM3 model checkpoint ...
-echo  ----------------------------------------------------------------
-echo.
-echo  ================================================================
-echo   HUGGINGFACE ACCESS REQUIRED
-echo  ================================================================
-echo.
-echo   1. Create a free account at: https://huggingface.co
-echo.
-echo   2. Request model access - one time, usually instant:
-echo      https://huggingface.co/facebook/sam3
-echo      Click "Agree and access repository"
-echo.
-echo   3. Create an access token:
-echo      https://huggingface.co/settings/tokens
-echo      Click "Create new token" and enable ALL 3 checkboxes:
-echo        [x] Read access to contents of all public gated repos
-echo        [x] Read access to contents of all repos you can access
-echo        [x] Make calls to inference providers
-echo      Then click "Create token" and copy it.
-echo.
-echo   4. Paste the token below and press ENTER
-echo.
-echo  ----------------------------------------------------------------
-echo   PRIVACY: Your token is stored ONLY locally on this PC at:
-echo   %USERPROFILE%\.cache\huggingface\token
-echo   It is NEVER sent anywhere except to huggingface.co
-echo  ----------------------------------------------------------------
-echo.
-set /p HF_TOKEN="  Your HuggingFace Token: "
-echo.
-
-if "!HF_TOKEN!"=="" (
-    echo  [ERROR] No token entered.
-    echo  Type "exit" to close this window.
-    goto :EOF
-)
-
-echo  [INFO] Logging in to HuggingFace ...
-cmd /c "venv\Scripts\hf.exe auth login --token !HF_TOKEN!"
-if errorlevel 1 (
-    echo  [ERROR] HuggingFace login failed. Check your token.
-    echo  Type "exit" to close this window.
-    goto :EOF
-)
-echo  [OK] HuggingFace login successful.
-echo.
-
-mkdir checkpoints\sam3 2>nul
-echo  [DOWNLOAD] Downloading SAM3 checkpoint - about 5 GB ...
-echo             DO NOT close this window!
-echo.
-cmd /c "venv\Scripts\hf.exe download facebook/sam3 --local-dir checkpoints\sam3 --token !HF_TOKEN!"
-if errorlevel 1 (
-    echo  [ERROR] SAM3 download failed. Check access and token.
-    echo  Type "exit" to close this window.
-    goto :EOF
-)
-echo  [OK] SAM3 checkpoint downloaded.
-
-:SAM3_OK
-echo.
-echo  [OK] SAM3 checkpoint is present.
 
 :: Mark setup as complete
 echo done > .setup_complete
