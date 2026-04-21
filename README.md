@@ -10,7 +10,7 @@ CrackDetect ist eine lokale Desktop-App zur **automatischen Riss-Erkennung** in 
   - GeoTIFF-Orthofotos mit echten Koordinaten (CRS, Affin-Transform).
   - World-File-Unterstützung: JPG/PNG mit Sidecar-Dateien (`.jgw` / `.pgw` / `.tfw` + `.prj`).
 - **Riss-Konturen**: Die erkannten Risse werden als geschlossene Umrandungen (Konturen) exportiert – die exakte Kante jedes Risses.
-- **Tiling fuer grosse Bilder**: Bilder >= Kachelgroesse werden automatisch gekachelt (Standard: 1024x1024 px, 256 px Ueberlappung). Ueberlappende Erkennungen werden zusammengefuehrt.
+- **Two-Pass Tiling fuer grosse Bilder**: Bilder werden automatisch in 512x512 px Kacheln aufgeteilt (= Modell-Trainingsgroesse, kein Qualitaetsverlust). Overlap ist adaptiv (Minimum 30%, automatisch erhoht damit Tiles das Bild gleichmaessig aufteilen). Nach Pass 1 werden zusaetzlich zentrierte Refine-Tiles direkt ueber erkannte Risse gelegt (Pass 2), damit Risse am Kachelrand vollstaendig erfasst werden. Ueberlappende Erkennungen werden zusammengefuehrt.
 - **Batch-Verarbeitung**: Komplette Ordner auf einmal verarbeiten.
 - **CAD & GIS Export** – wird automatisch neben dem Eingabebild gespeichert:
   - **Annotiertes Bild** (`<name>_cracks.png`): Original mit blauen Risslinien (skaliert auf max. 2000 px).

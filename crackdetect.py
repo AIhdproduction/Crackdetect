@@ -81,9 +81,8 @@ except ImportError:
 
 BASE_DIR = Path(__file__).parent
 
-TILE_SIZE        = 1024   # Standard-Kachelgroesse (512/768/1024 via UI)
-TILE_OVERLAP     = 256    # Feste Ueberlappung in Pixel
-TILE_OVERLAP_PCT = TILE_OVERLAP / TILE_SIZE  # fuer compute_tiles()
+TILE_SIZE        = 512    # Muss mit Modell-Eingang uebereinstimmen (training: image_size=512)
+TILE_OVERLAP_PCT = 0.30   # Ueberlappung zwischen Kacheln (30%)
 
 
 DEFAULT_CONFIDENCE = 0.70  # U-Net Schwellwert (0.01 - 0.99)
@@ -328,50 +327,136 @@ def compute_tiles(
 ) -> List[Tuple[int, int, int, int]]:
     """
     Gibt Liste von (x0, y0, x1, y1) Kacheln zurueck.
-    Randkacheln werden zurueckgesetzt, damit sie immer genau tile_size gross
-    sind (wenn moeglich) - verhindert das Abschneiden von Rissen am Rand.
+
+    Der Overlap ist adaptiv: als Minimum gilt overlap_pct (Standard 30%),
+    aber die Anzahl Kacheln N wird so gewaehlt, dass alle Tiles gleichmaessig
+    verteilt sind und exakt tile_size gross bleiben. Kein Rand-Sliver.
+
+    Algorithmus:
+      1. Berechne minimale Kachelanzahl N fuer jede Achse (Overlap >= min 30%)
+      2. Berechne den gleichmaessigen Stride fuer N Tiles
+      3. Platziere Tiles mit exaktem Stride; letztes Tile wird rechtsbuendig gesetzt
     """
-    overlap = max(64, int(tile_size * overlap_pct))
-    stride  = tile_size - overlap
-    tiles   = []
+    def _axis_starts(dim: int) -> List[int]:
+        if dim <= tile_size:
+            return [0]
+        min_overlap = int(tile_size * overlap_pct)
+        max_stride  = tile_size - min_overlap
+        # Mindestanzahl Kacheln damit alles abgedeckt ist
+        n_tiles = int(np.ceil((dim - tile_size) / max_stride)) + 1
+        if n_tiles < 2:
+            return [0]
+        # Gleichmaessiger Stride fuer genau n_tiles Kacheln
+        stride = (dim - tile_size) / (n_tiles - 1)
+        starts = [int(round(i * stride)) for i in range(n_tiles - 1)]
+        # Letztes Tile immer rechtsbuendig, damit kein Pixel fehlt
+        starts.append(dim - tile_size)
+        return starts
 
-    y0 = 0
-    while True:
-        y1_raw = y0 + tile_size
-        # Randkachel: zuruecksetzen damit sie volle Hoehe hat
-        if y1_raw > h:
-            y0 = max(0, h - tile_size)
-            y1 = h
-        else:
-            y1 = y1_raw
+    xs = _axis_starts(w)
+    ys = _axis_starts(h)
 
-        x0 = 0
-        while True:
-            x1_raw = x0 + tile_size
-            if x1_raw > w:
-                x0 = max(0, w - tile_size)
-                x1 = w
-            else:
-                x1 = x1_raw
-
-            tile_entry = (x0, y0, x1, y1)
-            if tile_entry not in tiles:
-                tiles.append(tile_entry)
-
-            if x1 >= w:
-                break
-            x0 += stride
-
-        if y1 >= h:
-            break
-        y0 += stride
+    tiles: List[Tuple[int, int, int, int]] = []
+    seen: set = set()
+    for y0 in ys:
+        y1 = min(h, y0 + tile_size)
+        for x0 in xs:
+            x1 = min(w, x0 + tile_size)
+            entry = (x0, y0, x1, y1)
+            if entry not in seen:
+                seen.add(entry)
+                tiles.append(entry)
 
     return tiles
 
 
-# ==============================================================================
-#  ERKENNUNG (U-Net)
-# ==============================================================================
+
+def compute_refine_tiles(
+    polygons: List,
+    img_w: int,
+    img_h: int,
+    tile_size: int,
+    pad_factor: float = 0.5,
+) -> List[Tuple[int, int, int, int]]:
+    """
+    Berechnet zentrierte Refine-Tiles fuer erkannte Riss-Polygone (Pass 2).
+
+    Fuer jedes Polygon wird die Bounding-Box berechnet und ein Tile mittig
+    darueber gelegt. Falls die BB groesser als tile_size ist, werden mehrere
+    ueberlappende Tiles entlang der BB erzeugt (30% Ueberlappung).
+    Duplikate werden dedupliziert.
+
+    Args:
+        polygons:   Liste der Shapely-Polygone aus Pass 1.
+        img_w:      Bildbreite in Pixeln.
+        img_h:      Bildhöhe in Pixeln.
+        tile_size:  Tile-Groesse in Pixeln.
+        pad_factor: Padding = pad_factor * tile_size (wird um BB herum addiert).
+
+    Returns:
+        Sortierte, deduplizierte Liste von (x0, y0, x1, y1) Refine-Tiles.
+    """
+    if not polygons:
+        return []
+
+    pad = int(tile_size * pad_factor)
+    overlap = int(tile_size * TILE_OVERLAP_PCT)
+    stride  = tile_size - overlap
+    seen: set = set()
+    result: List[Tuple[int, int, int, int]] = []
+
+    for poly in polygons:
+        try:
+            minx, miny, maxx, maxy = poly.bounds
+        except Exception:
+            continue
+
+        # Bounding-Box mit Padding erweitern
+        bx0 = max(0, int(minx) - pad)
+        by0 = max(0, int(miny) - pad)
+        bx1 = min(img_w, int(maxx) + pad)
+        by1 = min(img_h, int(maxy) + pad)
+
+        bb_w = bx1 - bx0
+        bb_h = by1 - by0
+
+        # Bounding-Box passt in ein Tile: zentriertes Tile erzeugen
+        if bb_w <= tile_size and bb_h <= tile_size:
+            cx = (bx0 + bx1) // 2
+            cy = (by0 + by1) // 2
+            tx0 = max(0, cx - tile_size // 2)
+            ty0 = max(0, cy - tile_size // 2)
+            tx1 = tx0 + tile_size
+            ty1 = ty0 + tile_size
+            # Randkorrektur: Tile darf nicht ueber das Bild hinausgehen
+            if tx1 > img_w:
+                tx0 = max(0, img_w - tile_size)
+                tx1 = img_w
+            if ty1 > img_h:
+                ty0 = max(0, img_h - tile_size)
+                ty1 = img_h
+            entry = (tx0, ty0, tx1, ty1)
+            if entry not in seen:
+                seen.add(entry)
+                result.append(entry)
+
+        else:
+            # Grosser Riss: Tiles entlang der BB mit 30% Overlap
+            sub_tiles = compute_tiles(bb_w, bb_h, tile_size=tile_size,
+                                      overlap_pct=TILE_OVERLAP_PCT)
+            for sx0, sy0, sx1, sy1 in sub_tiles:
+                tx0 = min(img_w, bx0 + sx0)
+                ty0 = min(img_h, by0 + sy0)
+                tx1 = min(img_w, bx0 + sx1)
+                ty1 = min(img_h, by0 + sy1)
+                entry = (tx0, ty0, tx1, ty1)
+                if entry not in seen:
+                    seen.add(entry)
+                    result.append(entry)
+
+    return result
+
+
 
 def _apply_closing(mask: np.ndarray, kernel_size: int = CLOSING_KERNEL_SIZE) -> np.ndarray:
     """Morphologisches Closing: verbindet unterbrochene Riss-Segmente."""
@@ -768,7 +853,7 @@ def process_geo_image(
     confidence: float    = 0.50,
     min_area: int        = 100,
     tile_size: int       = TILE_SIZE,
-    multi_scale: bool    = True,
+    multi_scale: bool    = False,
     progress_cb=None,
     log_fn=None,
 ) -> Tuple[np.ndarray, List[CrackFeature]]:
@@ -783,32 +868,71 @@ def process_geo_image(
     h, w = img.shape[:2]
     pixel_size_m = geo_image.pixel_size_m()
 
-    # --- Scale 1: Normales Tiling ---
-    pct_s1_end = 0.55 if multi_scale else 0.80
+
     if log_fn:
         log_fn("   [U-Net] Trainiertes Modell aktiv (ONNX)")
 
+    # ------------------------------------------------------------------
+    # Pass 1: Globales Tiling mit 30% Ueberlappung
+    # ------------------------------------------------------------------
+    if log_fn:
+        log_fn("   [Pass 1] Globales Tiling (30% Overlap) ...")
     polys1, scores1 = _run_scale(
         img, tile_size, confidence, min_area,
         log_fn=log_fn, progress_cb=progress_cb,
-        scale_label="Scale 1", pct_start=0.05, pct_end=pct_s1_end,
+        scale_label="Pass 1", pct_start=0.05, pct_end=0.50,
     )
 
-    # --- Scale 2: Halbe Kachelgroesse fuer feine Risse ---
+    # ------------------------------------------------------------------
+    # Pass 2: Zentrierte Refine-Tiles ueber erkannte Risse
+    # ------------------------------------------------------------------
     polys2:  List = []
     scores2: List[float] = []
+
+    if HAS_SHAPELY and polys1:
+        refine_tiles = compute_refine_tiles(
+            polys1, img_w=w, img_h=h, tile_size=tile_size
+        )
+        if log_fn:
+            log_fn(f"   [Pass 2] {len(refine_tiles)} Refine-Tiles ueber erkannte Risse ...")
+        if progress_cb:
+            progress_cb(0.52, f"Pass 2: {len(refine_tiles)} Refine-Tiles ...")
+
+        for i, (x0, y0, x1, y1) in enumerate(refine_tiles):
+            pct = 0.52 + 0.26 * i / max(1, len(refine_tiles))
+            if progress_cb:
+                progress_cb(pct, f"Refine {i+1}/{len(refine_tiles)}")
+            tile = img[y0:y1, x0:x1]
+            masks, scores = detect_unet_tile(tile, threshold=confidence, log_fn=log_fn)
+            for mask, score in zip(masks, scores):
+                poly = mask_to_polygon(mask, offset_x=x0, offset_y=y0, min_area=min_area)
+                if poly is not None:
+                    polys2.append(poly)
+                    scores2.append(score)
+
+        if log_fn:
+            log_fn(f"   [Pass 2] {len(polys2)} zusaetzliche Polygone aus Refine-Tiles")
+    elif log_fn:
+        log_fn("   [Pass 2] Uebersprungen (keine Risse in Pass 1 gefunden)")
+
+    # ------------------------------------------------------------------
+    # Optional: Multi-Scale (halbe Kachelgroesse) - Legacy-Fallback
+    # ------------------------------------------------------------------
+    polys_ms:  List = []
+    scores_ms: List[float] = []
     if multi_scale:
         small_tile = max(256, tile_size // 2)
         if log_fn:
-            log_fn(f"   [Scale 2] Feiner Durchlauf mit Kachelgroesse {small_tile} px ...")
-        polys2, scores2 = _run_scale(
+            log_fn(f"   [Multi-Scale] Feiner Durchlauf mit Kachelgroesse {small_tile} px ...")
+        polys_ms, scores_ms = _run_scale(
             img, small_tile, confidence, min_area,
             log_fn=log_fn, progress_cb=progress_cb,
-            scale_label="Scale 2", pct_start=pct_s1_end, pct_end=0.80,
+            scale_label="Multi-Scale", pct_start=0.78, pct_end=0.80,
         )
 
-    all_polygons = polys1 + polys2
-    all_scores   = scores1 + scores2
+    all_polygons = polys1 + polys2 + polys_ms
+    all_scores   = scores1 + scores2 + scores_ms
+
 
     # --- NMS ---
     if HAS_SHAPELY and len(all_polygons) > 1:
@@ -1379,8 +1503,8 @@ class CrackDetectApp(ctk.CTk):
         self._export_dxf     = ctk.BooleanVar(value=False)
         self._export_mask    = ctk.BooleanVar(value=False)
         self._epsilon_var    = ctk.DoubleVar(value=0.001)
-        self._tile_var       = ctk.StringVar(value="1024")
-        self._multiscale_var = ctk.BooleanVar(value=True)
+        self._tile_var       = ctk.StringVar(value="512")
+        self._multiscale_var = ctk.BooleanVar(value=False)
 
         self._build_ui()
         self._poll()
@@ -1648,6 +1772,13 @@ class CrackDetectApp(ctk.CTk):
             selected_hover_color=APP_COLORS["hover"],
         ).pack(padx=20, pady=(0, 4))
 
+        ctk.CTkLabel(
+            win,
+            text="Empfehlung: 512 (= Modell-Trainingsgroesse, bestes Ergebnis)",
+            font=ctk.CTkFont(size=10), text_color=APP_COLORS["text_dim"],
+            wraplength=340, justify="left",
+        ).pack(anchor="w", padx=20, pady=(0, 4))
+
         ctk.CTkCheckBox(
             win,
             text="Feine Risse (Multi-Scale)",
@@ -1733,21 +1864,15 @@ class CrackDetectApp(ctk.CTk):
             self._append_log("DXF nicht gefunden - Analyse zuerst ausfuehren.")
 
     def _open_zoom_window(self, _event=None):
-        """Klick auf Vorschau oeffnet scrollbares Zoom-Fenster mit vollem Bild."""
-        if self._last_annotated is None:
-            if self._last_output_img and Path(self._last_output_img).exists():
-                # Fallback: gespeichertes Bild laden
-                img = np.array(Image.open(self._last_output_img).convert("RGB"))
-                self._last_annotated = img
-            else:
-                return
-
-        if self._zoom_win is not None and self._zoom_win.winfo_exists():
-            self._zoom_win.focus()
-            return
-
-        self._zoom_win = ZoomWindow(self, self._last_annotated)
-        self._zoom_win.focus()
+        """Klick auf Vorschau oeffnet das gespeicherte Ergebnisbild im System-Viewer."""
+        if self._last_output_img and Path(self._last_output_img).exists():
+            os.startfile(str(self._last_output_img))
+        elif self._last_annotated is not None:
+            # Fallback: Bild temporaer speichern und oeffnen
+            import tempfile
+            tmp = Path(tempfile.mktemp(suffix="_crackdetect_preview.png"))
+            Image.fromarray(self._last_annotated).save(str(tmp))
+            os.startfile(str(tmp))
 
     def _append_log(self, text: str):
         self._log_box.configure(state="normal")
