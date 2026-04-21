@@ -29,7 +29,7 @@ CrackDetect ist für Windows konzipiert und bietet ein automatisches Setup-Skrip
 
 ## Technologie-Stack
 
-- **Erkennung + Segmentierung**: U-Net mit ResNet34-Backbone (PyTorch/ONNX) – trainiert auf Riss-Datensaetzen → direkte Pixel-Masken.
+- **Erkennung + Segmentierung**: U-Net mit ResNet34-Backbone (PyTorch/ONNX) – trainiert auf einem proprietaeren Riss-Datensatz mit **124.796 Bildern** → direkte Pixel-Masken.
 - **Kontur-Extraktion**: Polygon-Umrandung der erkannten Riss-Regionen.
 - **Geo-Verarbeitung**: `rasterio` & `shapely`.
 - **Export**: `ezdxf` & `json`.
@@ -46,25 +46,39 @@ CrackDetect ist für Windows konzipiert und bietet ein automatisches Setup-Skrip
    - `cracks_<ts>.dxf` – CAD-Export
 5. Mit **"Output"** öffnet sich der Ausgabeordner direkt im Explorer.
 
-## Eigenes Modell trainieren
+## Mitgeliefertes Basismodell
 
-CrackDetect verwendet ein eigenes U-Net Modell fuer die Riss-Erkennung. Das Modell wird auf deinen spezifischen Anwendungsfall trainiert und als ONNX-Datei eingebunden – so passt es sich exakt an das Material und den Blickwinkel an, den du in der Praxis verwendest.
+Das Repository enthaelt ein **vortrainiertes U-Net Modell** (`model/crack_unet.onnx`), das direkt als Basismodell fuer eigene Anwendungen genutzt werden kann.
 
-**Empfohlener Ansatz:**
+**Trainingsdaten:**
+- Trainiert auf **124.796 annotierten Rissbildern** aus einem proprietaeren Datensatz.
+- Der Datensatz gehoert ausschliesslich dem Entwickler und wird **nicht veroeffentlicht oder weitergegeben**.
+
+**Als Ausgangsbasis verwenden (Fine-Tuning):**
+
+Das mitgelieferte Modell liefert bereits solide Ergebnisse und kann als Startpunkt fuer eigenes Fine-Tuning genutzt werden – besonders wenn die eigenen Aufnahmesituationen sich vom trainierten Kontext unterscheiden:
+
+1. Lade das ONNX-Modell in deine Trainingsumgebung und exportiere es als PyTorch-Checkpoint.
+2. Initialisiere das U-Net mit den vortrainierten Gewichten (ResNet34 Encoder).
+3. Trainiere weiter auf deinen eigenen annotierten Bildern (Transfer Learning).
+4. Exportiere das fertige Modell erneut als ONNX und lege es unter `model/crack_unet.onnx` ab.
+
+## Eigenes Modell von Grund auf trainieren
+
+Alternativ kann ein komplett neues Modell trainiert werden:
 
 1. **Datensatz zusammenstellen** – Bilder + binaere Masken (weiss = Riss, schwarz = Hintergrund) in `images/` und `masks/` Ordner sortieren.
 2. **U-Net trainieren** – z. B. mit [segmentation_models.pytorch](https://github.com/qubvel/segmentation_models.pytorch) (ResNet34 Encoder, DiceFocalLoss).
 3. **Als ONNX exportieren** – `torch.onnx.export()` mit Eingabegroesse 512x512.
-4. **Modell ablegen** – die fertige `.onnx` Datei muss hier liegen damit die App sie automatisch laedt:
+4. **Modell ablegen** – die fertige `.onnx` Datei muss hier liegen:
    ```
    model\crack_unet.onnx
    ```
-   (Ordner `model/` neben `crackdetect.py` erstellen, falls noch nicht vorhanden)
 5. **App starten** – CrackDetect erkennt das Modell beim naechsten Start automatisch.
 
-**Wichtig – eigene Daten liefern die besten Ergebnisse:**
+**Eigene Daten liefern die besten Ergebnisse:**
 
-Ein Modell erkennt nur zuverlaessig, wofuer es trainiert wurde. Ein Modell, das auf Strassenfotos trainiert wurde, wird bei Drohnenaufnahmen von Betondaechern schlechte Ergebnisse liefern – und umgekehrt. Deshalb gilt: **Sammle eigene Fotos von genau dem Material und dem Blickwinkel, den du in der Praxis verwendest, und annotiere diese manuell.** Bereits 200–500 sauber annotierte Bilder von deiner spezifischen Aufnahmesituation uebertreffen in der Regel grosse oeffentliche Datensaetze aus anderen Kontexten.
+Ein Modell erkennt nur zuverlaessig, wofuer es trainiert wurde. Deshalb gilt: Sammle eigene Fotos von genau dem Material und dem Blickwinkel, den du in der Praxis verwendest, und annotiere diese manuell. Bereits 200-500 sauber annotierte Bilder von deiner spezifischen Aufnahmesituation uebertreffen in der Regel grosse oeffentliche Datensaetze aus anderen Kontexten.
 
 Oeffentliche Datensaetze koennen als **Ausgangsbasis oder Ergaenzung** dienen, sollten aber nicht der einzige Trainingsinput sein:
 
