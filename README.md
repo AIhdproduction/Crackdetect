@@ -48,7 +48,12 @@ CrackDetect ist fuer Windows konzipiert und bietet ein automatisches Setup-Skrip
 
 ## Mitgeliefertes Basismodell
 
-Das Repository enthaelt ein **vortrainiertes U-Net Modell** (`model/crack_unet.onnx`), das direkt genutzt werden kann.
+Das Repository enthaelt ein **vortrainiertes U-Net Modell** in zwei Formaten:
+
+| Datei | Zweck |
+|---|---|
+| `model/crack_unet.onnx` | Direkt in CrackDetect verwendbar (Inferenz) |
+| `model/best_model.pth` | PyTorch-Checkpoint fuer Fine-Tuning |
 
 - Trainiert auf **124.796 annotierten Rissbildern** aus einem proprietaeren Datensatz.
 - Der Datensatz gehoert ausschliesslich dem Entwickler und wird **nicht veroeffentlicht oder weitergegeben**.
@@ -67,7 +72,7 @@ Die App exportiert bei jeder Erkennung automatisch binaere Rissmasken (`*_cracks
 **So funktioniert das Fine-Tuning:**
 
 1. Eigene Bilder mit CrackDetect analysieren - die erzeugten Masken als Trainingsgrundlage verwenden.
-2. Das ONNX-Modell als PyTorch-Checkpoint laden und mit den vortrainierten Gewichten initialisieren.
+2. `model/best_model.pth` als Startpunkt laden (vortrainierte Gewichte, kein Training von Null).
 3. Weitertraining auf den eigenen Daten (Transfer Learning).
-4. Fertiges Modell erneut als ONNX exportieren und unter `model/crack_unet.onnx` ablegen.
+4. Fertiges Modell als ONNX exportieren und unter `model/crack_unet.onnx` ablegen.
 5. CrackDetect startet beim naechsten Mal automatisch mit dem verbesserten Modell.
