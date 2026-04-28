@@ -28,6 +28,8 @@ Binaere Rissmaske (Segmentierungsausgabe des Modells):
 
 ![Crack segmentation mask](assets/Crack_1-_-137929759-10356122_mask.png)
 
+> Die gezeigten Ergebnisse wurden mit den **Standardeinstellungen** der App erzeugt. Das verwendete Bild ist **nicht Teil der Trainingsdaten** und dient ausschliesslich zur Demonstration der Erkennungsleistung.
+
 ## Installation & Start
 
 CrackDetect ist fuer Windows konzipiert und bietet ein automatisches Setup-Skript.
