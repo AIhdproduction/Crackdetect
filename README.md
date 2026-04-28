@@ -18,6 +18,16 @@ CrackDetect ist eine lokale Desktop-App zur **automatischen Riss-Erkennung** in 
   - **DXF**: Export fuer CAD (Layer `CRACKS` mit LWPOLYLINE, Layer `CRACK_LABELS`).
 - **Desktop-App**: Natives Windows-Fenster (customtkinter), kein Browser noetig.
 
+## Beispiel-Ergebnisse
+
+Originalbild mit erkannten Risslinien (blau):
+
+![Crack detection result](assets/Crack_1-_-137929759-10356122_cracks.png)
+
+Binaere Rissmaske (Segmentierungsausgabe des Modells):
+
+![Crack segmentation mask](assets/Crack_1-_-137929759-10356122_mask.png)
+
 ## Installation & Start
 
 CrackDetect ist fuer Windows konzipiert und bietet ein automatisches Setup-Skript.

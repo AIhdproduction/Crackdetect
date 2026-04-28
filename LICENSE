@@ -1,0 +1,144 @@
+MIT License with Commons Clause
+
+Copyright (c) 2026 AIhdproduction
+https://github.com/AIhdproduction/CrackDetect
+
+-------------------------------------------------------------------------------
+COMMONS CLAUSE (Restriction on Commercial Use)
+-------------------------------------------------------------------------------
+
+The Software is provided to you by the Licensor under the License, as defined
+below, subject to the following condition:
+
+Without limiting other conditions in the License, the grant of rights under
+the License will not include, and the License does not grant to you, the right
+to Sell the Software or to use the Software as part of a commercial product
+or service offered to third parties.
+
+For purposes of the foregoing, "Sell" means practicing any or all of the
+rights granted to you under the License to provide to third parties, for a
+fee or other consideration (including without limitation fees for hosting
+or consulting/support services related to the Software), a product or service
+whose value derives, entirely or substantially, from the functionality of the
+Software.
+
+In addition, the following uses are explicitly considered commercial use and
+require a separate written agreement with the author:
+
+  (a) Using the Software to process, inspect, or analyze images or other data
+      as part of a paid service, contract, or commission — regardless of
+      whether the Software itself is sold or only its output is delivered.
+
+  (b) Using the output of the Software (e.g. crack detection results, annotated
+      images, GeoJSON/DXF exports) as part of a product, report, or dataset
+      that is sold, licensed, or otherwise monetized by a company or individual
+      acting in a commercial capacity.
+
+  (c) Integrating the Software into any internal business workflow where the
+      processing of data with the Software directly contributes to revenue
+      generation, billable work, or commercial deliverables.
+
+COMMERCIAL USE REQUIRES A SEPARATE WRITTEN AGREEMENT WITH THE AUTHOR.
+To obtain a commercial license, please contact:
+  GitHub: https://github.com/AIhdproduction/CrackDetect/issues
+
+Any commercial license granted will be at the sole discretion of the author
+and may involve a one-time fee, a subscription, or other arrangement agreed
+upon by both parties.
+
+-------------------------------------------------------------------------------
+MODEL LICENSE
+-------------------------------------------------------------------------------
+
+The included pre-trained U-Net model (crack_unet.onnx and best_model.pth) is
+the exclusive intellectual property of AIhdproduction. The model was trained
+on a proprietary dataset of 124,796 annotated crack images which is not
+publicly available and will not be released.
+
+The model may be used freely under the non-commercial terms of this license.
+This includes running inference locally and using it as a starting point for
+fine-tuning on your own data (transfer learning).
+
+The PyTorch checkpoint (best_model.pth) is not included in this repository by
+default. If you need it for fine-tuning purposes, you may request it here:
+  GitHub: https://github.com/AIhdproduction/CrackDetect/issues
+
+Requests will be reviewed individually. The checkpoint will only be shared for
+non-commercial research, education, or personal fine-tuning purposes.
+
+-------------------------------------------------------------------------------
+MIT LICENSE (Base License - applies to all non-commercial use)
+-------------------------------------------------------------------------------
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or use
+copies of the Software for non-commercial purposes, and to permit persons to
+whom the Software is furnished to do so, subject to the following conditions:
+
+The above copyright notice, the Commons Clause above, and this permission
+notice shall be included in all copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+-------------------------------------------------------------------------------
+WHAT IS ALLOWED (non-commercial use)
+-------------------------------------------------------------------------------
+
+  +  Personal use and private projects
+  +  Academic research and education
+  +  Non-profit organizations
+  +  Evaluation and testing
+  +  Modification and redistribution - provided this license is retained
+  +  Fine-tuning the model on your own data (best_model.pth available on request)
+
+WHAT REQUIRES A COMMERCIAL LICENSE (contact the author)
+-------------------------------------------------------------------------------
+
+  -  Using this software as part of a paid inspection, survey, or assessment service
+  -  Integrating into a commercial application sold or licensed to customers
+  -  Offering crack detection as a commercial service (SaaS, API, etc.)
+  -  Using within a company to process data as part of a revenue-generating workflow
+  -  Selling or licensing output data (annotated images, GeoJSON, DXF files) commercially
+
+-------------------------------------------------------------------------------
+THIRD-PARTY COMPONENT LICENSES
+-------------------------------------------------------------------------------
+
+CrackDetect integrates the following third-party components. These components
+retain their own licenses and are NOT subject to the Commons Clause above.
+Only the CrackDetect application code and the included model are covered by
+this license.
+
+  - PyTorch                   BSD 3-Clause License
+                               https://github.com/pytorch/pytorch/blob/main/LICENSE
+
+  - ONNX Runtime              MIT License
+                               https://github.com/microsoft/onnxruntime/blob/main/LICENSE
+
+  - OpenCV                    Apache License 2.0
+                               https://github.com/opencv/opencv/blob/master/LICENSE
+
+  - rasterio                  BSD 3-Clause License
+                               https://github.com/rasterio/rasterio/blob/main/LICENSE
+
+  - shapely                   BSD 3-Clause License
+                               https://github.com/shapely/shapely/blob/main/LICENSE.txt
+
+  - ezdxf                     MIT License
+                               https://github.com/mozman/ezdxf/blob/master/LICENSE
+
+  - customtkinter             MIT License
+                               https://github.com/TomSchimansky/CustomTkinter/blob/master/LICENSE
+
+  - Pillow (PIL)              HPND License
+                               https://github.com/python-pillow/Pillow/blob/main/LICENSE
+
+-------------------------------------------------------------------------------
