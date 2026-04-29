@@ -84,17 +84,15 @@ Wie bei jedem KI-Modell gilt: Es erkennt am zuverlaessigsten, wofuer es trainier
 
 ## Fine-Tuning mit eigenen Bildern
 
-Das Modell kann jederzeit mit eigenen Aufnahmen weiter trainiert werden. So lernt es genau das zu erkennen, was im jeweiligen Anwendungsfall wichtig ist - ob feine Haarrisse, breite Schadstellen oder bestimmte Materialien.
+Das Modell kann mit eigenen Aufnahmen weiter trainiert werden. So lernt es genau das zu erkennen, was im jeweiligen Anwendungsfall wichtig ist - ob feine Haarrisse, breite Schadstellen oder bestimmte Materialien.
 
-### Workflow: Maske erzeugen, anpassen, trainieren
-
-**Schritt 1 - Maske automatisch erzeugen**
+### Schritt 1 - Maske automatisch erzeugen
 
 Das eigene Bild mit CrackDetect analysieren. Die App erzeugt dabei automatisch zwei Dateien im `output/`-Ordner:
 - `<name>_cracks.png` - das Originalbild mit eingezeichneten Risslinien
 - `<name>_mask.png` - die binaere Rissmaske (weiss = Riss, schwarz = Hintergrund)
 
-**Schritt 2 - Maske manuell nachbessern (GIMP oder Photoshop)**
+### Schritt 2 - Maske manuell nachbessern (GIMP oder Photoshop)
 
 Die erzeugte Maske in GIMP oder Photoshop oeffnen und so lange anpassen, bis sie exakt das zeigt, was das Modell kuenftig erkennen soll:
 - Risse die das Modell uebersehen hat: **weiss einmalen**
@@ -103,29 +101,13 @@ Die erzeugte Maske in GIMP oder Photoshop oeffnen und so lange anpassen, bis sie
 
 > Die Maske muss immer rein binaer bleiben - nur reines Weiss (`#FFFFFF`) und reines Schwarz (`#000000`). Graustufen oder Antialiasing verfaelschen das Training. In GIMP: `Bild > Modus > Graustufen`, dann mit dem Pinsel-Werkzeug (Haerte 100%) arbeiten. In Photoshop: Ebene als Bitmap anlegen oder den Pinsel auf harte Kante stellen.
 
-**Schritt 3 - Als Trainingsdaten ablegen**
-
-- Originalbild nach `Train/traindata/images/` kopieren
-- Nachgebesserte Maske nach `Train/traindata/masks/` kopieren (Dateiname identisch mit dem Bild, nur Endung `.png`)
-
 Je mehr sorgfaeltig nachgebesserte Masken vorhanden sind, desto gezielter lernt das Modell. Schon 20-30 gut annotierte Bilder koennen die Erkennungsleistung fuer einen bestimmten Anwendungsfall deutlich verbessern.
 
-**Schritt 4 - Fine-Tuning starten**
-
-```
-python Train/train.py --weights model/best_model.pth
-```
-
-Das Modell startet nicht von Null, sondern baut auf dem vortrainierten Stand auf (Transfer Learning). Die bisherigen Faehigkeiten bleiben erhalten - es lernt nur dazu.
-
-**Schritt 5 - Modell exportieren und einsetzen**
-
-```
-python Train/export_onnx.py
-```
-
-Die fertige `crack_unet.onnx` unter `model/crack_unet.onnx` ablegen. CrackDetect erkennt das neue Modell beim naechsten Start automatisch.
-
----
-
 Dieser Zyklus (erkennen -> Maske pruefen -> nachbessern -> trainieren) laesst sich beliebig oft wiederholen, bis das Modell alles sicher erkennt, was es erkennen soll.
+
+### Schritt 3 - Fine-Tuning
+
+Die Trainings-Pipeline ist nicht Bestandteil dieses Repositories. Es gibt zwei Wege:
+
+- **Eigene Pipeline aufbauen**: Das Modell basiert auf U-Net mit ResNet34-Backbone (PyTorch). Die noetige Trainingslogik laesst sich mit gaengigen Frameworks (PyTorch, segmentation-models-pytorch) selbst implementieren. Als Startgewichte dient `model/best_model.pth`.
+- **Training beauftragen**: Wer die fertige Trainings-Pipeline verwenden moechte oder das Modell gezielt auf eigene Daten anpassen lassen will, kann eine Anfrage stellen - einfach Kontakt aufnehmen und die Bilder sowie die gewuenschten Erkennungsziele beschreiben.
