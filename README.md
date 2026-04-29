@@ -20,15 +20,24 @@ CrackDetect ist eine lokale Desktop-App zur **automatischen Riss-Erkennung** in 
 
 ## Beispiel-Ergebnisse
 
-Originalbild mit erkannten Risslinien (blau):
+Originalbild:
 
-![Crack detection result](assets/Crack_1-_-137929759-10356122_cracks.png)
+![Original image](assets/Fine_crack_orig.jpg)
+
+Erkannte Risslinien (blau eingezeichnet):
+
+![Crack detection result](assets/Fine_crack_cracks.png)
 
 Binaere Rissmaske (Segmentierungsausgabe des Modells):
 
-![Crack segmentation mask](assets/Crack_1-_-137929759-10356122_mask.png)
+![Crack segmentation mask](assets/Fine_crack_mask.png)
 
-> Die gezeigten Ergebnisse wurden mit den **Standardeinstellungen** der App erzeugt. Das verwendete Bild ist **nicht Teil der Trainingsdaten** und dient ausschliesslich zur Demonstration der Erkennungsleistung.
+> Die gezeigten Ergebnisse wurden mit folgenden Einstellungen erzeugt, mit denen das Modell **alle feinen Risse** sicher erkannt hat:
+> - **Kontur-Glaettung**: 0.0010 (sehr niedrig = maximale Detail-Treue)
+> - **Kachelgroesse**: 512 px (entspricht der Modell-Trainingsgroesse, bestes Ergebnis)
+> - **Feine Risse (Multi-Scale)**: aktiviert
+>
+> Das verwendete Bild ist **nicht Teil der Trainingsdaten** und dient ausschliesslich zur Demonstration der Erkennungsleistung.
 
 ## Installation & Start
 
