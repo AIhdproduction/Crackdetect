@@ -107,7 +107,7 @@ Dieser Zyklus (erkennen -> Maske pruefen -> nachbessern -> trainieren) laesst si
 
 ### Schritt 3 - Fine-Tuning
 
-Die Trainings-Pipeline ist nicht Bestandteil dieses Repositories. Es gibt zwei Wege:
+Die Trainings-Pipeline ist nicht Bestandteil dieses Repositories. Es gibt zwei Moeglichkeiten:
 
-- **Eigene Pipeline aufbauen**: Das Modell basiert auf U-Net mit ResNet34-Backbone (PyTorch). Die noetige Trainingslogik laesst sich mit gaengigen Frameworks (PyTorch, segmentation-models-pytorch) selbst implementieren. Als Startgewichte dient `model/best_model.pth`.
-- **Training beauftragen**: Wer die fertige Trainings-Pipeline verwenden moechte oder das Modell gezielt auf eigene Daten anpassen lassen will, kann eine Anfrage stellen - einfach Kontakt aufnehmen und die Bilder sowie die gewuenschten Erkennungsziele beschreiben.
+- **Trainingsdaten einsenden**: Wer eigene annotierte Bilder und Masken zur Verfuegung stellt, kann damit das Modell fuer alle verbessern lassen. Die Daten werden eingearbeitet, das Modell neu trainiert und die verbesserte Version veroeffentlicht.
+- **Eigene Pipeline anfragen**: Wer das Modell selbst und unabhaengig weiter trainieren moechte, kann die Trainings-Pipeline direkt anfragen. Einfach Kontakt aufnehmen - die Voraussetzungen und den genauen Anwendungsfall kurz beschreiben.
